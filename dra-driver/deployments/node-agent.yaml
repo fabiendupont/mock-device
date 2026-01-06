@@ -1,0 +1,71 @@
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: mock-accel-node-agent
+  namespace: mock-device
+  labels:
+    app: mock-accel-node-agent
+spec:
+  selector:
+    matchLabels:
+      app: mock-accel-node-agent
+  template:
+    metadata:
+      labels:
+        app: mock-accel-node-agent
+    spec:
+      serviceAccountName: mock-accel-node-agent
+      hostNetwork: true
+      containers:
+      - name: node-agent
+        image: localhost/mock-accel-dra-driver:dev
+        imagePullPolicy: IfNotPresent
+        command:
+        - /dra-driver
+        args:
+        - --mode=node-agent
+        - --driver-name=mock-accel.example.com
+        - --plugin-socket=/var/lib/kubelet/plugins/mock-accel.example.com
+        - --v=5
+        env:
+        - name: NODE_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: spec.nodeName
+        volumeMounts:
+        - name: sysfs
+          mountPath: /sys/class/mock-accel
+          readOnly: false
+        - name: kubelet-plugin-dir
+          mountPath: /var/lib/kubelet/plugins/mock-accel.example.com
+        - name: kubelet-plugins-registry
+          mountPath: /var/lib/kubelet/plugins_registry
+        - name: cdi
+          mountPath: /var/run/cdi
+        securityContext:
+          privileged: true
+          runAsUser: 0
+        resources:
+          requests:
+            cpu: 100m
+            memory: 128Mi
+          limits:
+            cpu: 200m
+            memory: 256Mi
+      volumes:
+      - name: sysfs
+        hostPath:
+          path: /sys/class/mock-accel
+          type: Directory
+      - name: kubelet-plugin-dir
+        hostPath:
+          path: /var/lib/kubelet/plugins/mock-accel.example.com
+          type: DirectoryOrCreate
+      - name: kubelet-plugins-registry
+        hostPath:
+          path: /var/lib/kubelet/plugins_registry
+          type: DirectoryOrCreate
+      - name: cdi
+        hostPath:
+          path: /var/run/cdi
+          type: DirectoryOrCreate

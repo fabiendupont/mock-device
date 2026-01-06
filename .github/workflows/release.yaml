@@ -1,0 +1,398 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'  # Trigger on version tags (e.g., v1.0.0)
+
+env:
+  GO_VERSION: "1.24"
+  REGISTRY: ghcr.io
+  IMAGE_PREFIX: ${{ github.repository_owner }}
+
+jobs:
+  # Job 1: Parse version from tag
+  version:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.get_version.outputs.version }}
+      version_no_v: ${{ steps.get_version.outputs.version_no_v }}
+      git_commit: ${{ steps.get_version.outputs.git_commit }}
+      is_prerelease: ${{ steps.get_version.outputs.is_prerelease }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          submodules: recursive
+
+      - name: Get version from tag
+        id: get_version
+        run: |
+          VERSION=${GITHUB_REF#refs/tags/}  # v1.0.0
+          VERSION_NO_V=${VERSION#v}         # 1.0.0
+          GIT_COMMIT=$(git rev-parse --short HEAD)
+
+          # Check if prerelease (contains -, alpha, beta, rc)
+          if [[ "$VERSION" =~ -|alpha|beta|rc ]]; then
+            IS_PRERELEASE=true
+          else
+            IS_PRERELEASE=false
+          fi
+
+          echo "version=${VERSION}" >> $GITHUB_OUTPUT
+          echo "version_no_v=${VERSION_NO_V}" >> $GITHUB_OUTPUT
+          echo "git_commit=${GIT_COMMIT}" >> $GITHUB_OUTPUT
+          echo "is_prerelease=${IS_PRERELEASE}" >> $GITHUB_OUTPUT
+          echo "Release version: ${VERSION} (prerelease: ${IS_PRERELEASE})"
+
+      - name: Verify VERSION file matches tag
+        run: |
+          FILE_VERSION=$(cat VERSION)
+          TAG_VERSION="${{ steps.get_version.outputs.version_no_v }}"
+          if [ "$FILE_VERSION" != "$TAG_VERSION" ]; then
+            echo "ERROR: VERSION file ($FILE_VERSION) does not match tag ($TAG_VERSION)"
+            exit 1
+          fi
+
+  # Job 2: Build and test
+  build-test:
+    needs: [version]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+
+      - name: Run tests
+        working-directory: dra-driver
+        run: go test -v ./...
+
+  # Job 3: Build release binaries
+  build-binaries:
+    needs: [version, build-test]
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        os: [linux]
+        arch: [amd64, arm64]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive  # Include libvfio-user
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+
+      - name: Build DRA driver binary
+        working-directory: dra-driver
+        env:
+          GOOS: ${{ matrix.os }}
+          GOARCH: ${{ matrix.arch }}
+          CGO_ENABLED: 0
+        run: |
+          mkdir -p ../artifacts
+          go build \
+            -ldflags="-X 'github.com/fabiendupont/mock-device/dra-driver/pkg/version.Version=${{ needs.version.outputs.version }}' \
+                      -X 'github.com/fabiendupont/mock-device/dra-driver/pkg/version.GitCommit=${{ needs.version.outputs.git_commit }}'" \
+            -o ../artifacts/dra-driver-${{ matrix.os }}-${{ matrix.arch }} \
+            ./cmd/dra-driver
+
+      - name: Install build dependencies (amd64 only)
+        if: matrix.arch == 'amd64'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake gcc make libjson-c-dev
+
+      - name: Build libvfio-user (amd64 only)
+        if: matrix.arch == 'amd64'
+        working-directory: libvfio-user
+        run: |
+          mkdir -p build && cd build
+          cmake -DCMAKE_BUILD_TYPE=Release ..
+          make
+
+      - name: Build mock-accel-server (amd64 only)
+        if: matrix.arch == 'amd64'
+        working-directory: vfio-user
+        run: |
+          make
+          cp mock-accel-server ../artifacts/mock-accel-server-${{ matrix.os }}-${{ matrix.arch }}
+
+      - name: Upload binaries
+        uses: actions/upload-artifact@v4
+        with:
+          name: binaries-${{ matrix.os }}-${{ matrix.arch }}
+          path: artifacts/*
+
+  # Job 4: Build and push container images
+  build-images:
+    needs: [version, build-test]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      matrix:
+        include:
+          # DRA driver image
+          - component: dra-driver
+            context: ./dra-driver
+            dockerfile: ./dra-driver/Dockerfile
+            image_name: mock-accel-dra-driver
+            platforms: linux/amd64,linux/arm64
+          # Kernel module images (per distro)
+          - component: kernel-module-fc43
+            context: .
+            dockerfile: ./Containerfile
+            image_name: mock-accel-module
+            platforms: linux/amd64
+            kernel_version: latest
+            distro_tag: fc43
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to ghcr.io
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata (DRA driver)
+        if: matrix.component == 'dra-driver'
+        id: meta-dra
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_PREFIX }}/${{ matrix.image_name }}
+          tags: |
+            type=semver,pattern={{version}},value=${{ needs.version.outputs.version }}
+            type=semver,pattern={{major}}.{{minor}},value=${{ needs.version.outputs.version }}
+            type=semver,pattern={{major}},value=${{ needs.version.outputs.version }}
+            type=raw,value=latest,enable=${{ needs.version.outputs.is_prerelease == 'false' }}
+
+      - name: Extract metadata (Kernel module)
+        if: startsWith(matrix.component, 'kernel-module')
+        id: meta-module
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_PREFIX }}/${{ matrix.image_name }}
+          tags: |
+            type=raw,value=${{ needs.version.outputs.version }}-${{ matrix.distro_tag }}
+            type=raw,value=latest-${{ matrix.distro_tag }},enable=${{ needs.version.outputs.is_prerelease == 'false' }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v5
+        with:
+          context: ${{ matrix.context }}
+          file: ${{ matrix.dockerfile }}
+          platforms: ${{ matrix.platforms }}
+          push: true
+          tags: ${{ matrix.component == 'dra-driver' && steps.meta-dra.outputs.tags || steps.meta-module.outputs.tags }}
+          labels: ${{ matrix.component == 'dra-driver' && steps.meta-dra.outputs.labels || steps.meta-module.outputs.labels }}
+          build-args: |
+            VERSION=${{ needs.version.outputs.version }}
+            GIT_COMMIT=${{ needs.version.outputs.git_commit }}
+            KERNEL_VERSION=${{ matrix.kernel_version }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  # Job 5: Create source tarballs
+  create-tarballs:
+    needs: [version]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive  # Include libvfio-user
+
+      - name: Create full source tarball
+        run: |
+          mkdir -p artifacts
+          tar --exclude='.git' --exclude='artifacts' \
+              -czf artifacts/mock-device-${{ needs.version.outputs.version }}-source.tar.gz .
+
+      - name: Create component tarballs
+        run: |
+          # vfio-user (include libvfio-user source)
+          tar -czf artifacts/mock-device-${{ needs.version.outputs.version }}-vfio-user.tar.gz \
+              vfio-user/ libvfio-user/ VERSION README.md LICENSE
+
+          # kernel-driver
+          tar -czf artifacts/mock-device-${{ needs.version.outputs.version }}-kernel-driver.tar.gz \
+              kernel-driver/ VERSION README.md LICENSE
+
+          # dra-driver
+          tar -czf artifacts/mock-device-${{ needs.version.outputs.version }}-dra-driver.tar.gz \
+              dra-driver/ VERSION README.md LICENSE
+
+      - name: Generate checksums
+        working-directory: artifacts
+        run: sha256sum *.tar.gz > SHA256SUMS
+
+      - name: Upload tarballs
+        uses: actions/upload-artifact@v4
+        with:
+          name: source-tarballs
+          path: artifacts/*
+
+  # Job 6: Package Helm chart
+  package-helm:
+    needs: [version]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Helm
+        uses: azure/setup-helm@v3
+        with:
+          version: v3.14.0
+
+      - name: Update Chart.yaml version
+        run: |
+          VERSION="${{ needs.version.outputs.version_no_v }}"
+          sed -i "s/^version:.*/version: ${VERSION}/" charts/mock-device/Chart.yaml
+          sed -i "s/^appVersion:.*/appVersion: \"${VERSION}\"/" charts/mock-device/Chart.yaml
+
+      - name: Lint Helm chart
+        run: helm lint charts/mock-device
+
+      - name: Package Helm chart
+        run: |
+          mkdir -p artifacts
+          helm package charts/mock-device -d artifacts
+
+      - name: Log in to ghcr.io (OCI registry)
+        run: |
+          echo "${{ secrets.GITHUB_TOKEN }}" | helm registry login ${{ env.REGISTRY }} --username ${{ github.actor }} --password-stdin
+
+      - name: Push Helm chart to OCI registry
+        run: |
+          helm push artifacts/mock-device-${{ needs.version.outputs.version_no_v }}.tgz oci://${{ env.REGISTRY }}/${{ env.IMAGE_PREFIX }}/charts
+
+      - name: Upload Helm chart artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: helm-chart
+          path: artifacts/*.tgz
+
+  # Job 7: Create GitHub Release
+  create-release:
+    needs: [version, build-binaries, build-images, create-tarballs, package-helm]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts-all
+
+      - name: Prepare release assets
+        run: |
+          mkdir -p release-assets
+
+          # Copy tarballs
+          cp artifacts-all/source-tarballs/* release-assets/ || true
+
+          # Copy binaries
+          find artifacts-all/binaries-* -type f -exec cp {} release-assets/ \; || true
+
+          # Copy Helm chart
+          cp artifacts-all/helm-chart/*.tgz release-assets/ || true
+
+          ls -lah release-assets/
+
+      - name: Generate release notes
+        id: release_notes
+        run: |
+          cat > release-notes.md << 'EOF'
+          ## Mock Device ${{ needs.version.outputs.version }}
+
+          ### What's Included
+
+          This release provides all components needed to test Kubernetes DRA drivers with mock PCIe accelerator devices.
+
+          **Components:**
+          - **DRA Driver**: Kubernetes DRA driver (controller + node agent)
+          - **Kernel Module**: `mock-accel.ko` kernel module for device emulation
+          - **vfio-user Server**: Userspace PCIe device emulator
+
+          **Container Images:**
+          - `ghcr.io/${{ env.IMAGE_PREFIX }}/mock-accel-dra-driver:${{ needs.version.outputs.version }}`
+          - `ghcr.io/${{ env.IMAGE_PREFIX }}/mock-accel-module:${{ needs.version.outputs.version }}-fc43`
+
+          **Helm Chart:**
+          ```bash
+          helm install mock-device oci://ghcr.io/${{ env.IMAGE_PREFIX }}/charts/mock-device --version ${{ needs.version.outputs.version_no_v }}
+          ```
+
+          ### Installation
+
+          See [Installation Guide](https://github.com/${{ github.repository }}/blob/${{ needs.version.outputs.version }}/docs/installation-guide.md) for detailed instructions.
+
+          ### Quick Start
+
+          ```bash
+          # Install Helm chart (assumes KMM operator installed)
+          helm install mock-device oci://ghcr.io/${{ env.IMAGE_PREFIX }}/charts/mock-device \
+            --version ${{ needs.version.outputs.version_no_v }} \
+            --set kernelModule.enabled=true
+
+          # Verify installation
+          kubectl get resourceslices -l driver=mock-accel.example.com
+          ```
+
+          ### Compatibility
+
+          - **Kubernetes**: 1.29+ (DRA v1alpha3 API)
+          - **Kernel**: 6.11+ (Fedora 43)
+          - **Runtime**: crun (finit_module syscall support required)
+
+          ### Integration
+
+          This release is compatible with:
+          - [k8s-dra-driver-nodepartition](https://github.com/fabiendupont/k8s-dra-driver-nodepartition) (all versions)
+
+          ### Checksums
+
+          See `SHA256SUMS` file in release assets.
+          EOF
+
+          echo "release_notes_file=release-notes.md" >> $GITHUB_OUTPUT
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: ${{ needs.version.outputs.version }}
+          name: Mock Device ${{ needs.version.outputs.version }}
+          body_path: release-notes.md
+          draft: false
+          prerelease: ${{ needs.version.outputs.is_prerelease }}
+          files: release-assets/*
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

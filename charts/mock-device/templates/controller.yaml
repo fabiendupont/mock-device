@@ -1,0 +1,64 @@
+{{- if .Values.draDriver.controller.enabled }}
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: {{ include "mock-device.fullname" . }}-controller
+  namespace: {{ include "mock-device.namespace" . }}
+  labels:
+    {{- include "mock-device.controller.labels" . | nindent 4 }}
+spec:
+  selector:
+    matchLabels:
+      app: mock-accel-controller
+      {{- include "mock-device.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        app: mock-accel-controller
+        {{- include "mock-device.controller.labels" . | nindent 8 }}
+    spec:
+      serviceAccountName: {{ include "mock-device.controller.serviceAccountName" . }}
+      {{- with .Values.global.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+      - name: controller
+        image: {{ include "mock-device.draDriver.image" . }}
+        imagePullPolicy: {{ .Values.draDriver.controller.image.pullPolicy }}
+        command:
+        - /dra-driver
+        args:
+        - --mode=controller
+        - --driver-name={{ .Values.draDriver.name }}
+        - --rescan-interval={{ .Values.draDriver.controller.rescanInterval }}
+        - --v={{ .Values.draDriver.controller.verbosity }}
+        env:
+        - name: NODE_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: spec.nodeName
+        volumeMounts:
+        - name: sysfs
+          mountPath: /sys/class/mock-accel
+          readOnly: true
+        resources:
+          {{- toYaml .Values.draDriver.controller.resources | nindent 10 }}
+      volumes:
+      - name: sysfs
+        hostPath:
+          path: /sys/class/mock-accel
+          type: Directory
+      {{- with .Values.draDriver.controller.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.draDriver.controller.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.draDriver.controller.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+{{- end }}

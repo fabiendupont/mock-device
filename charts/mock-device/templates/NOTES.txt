@@ -1,0 +1,58 @@
+Thank you for installing {{ .Chart.Name }}.
+
+Your release is named {{ .Release.Name }}.
+
+To learn more about the release, try:
+
+  $ helm status {{ .Release.Name }} -n {{ include "mock-device.namespace" . }}
+  $ helm get all {{ .Release.Name }} -n {{ include "mock-device.namespace" . }}
+
+{{ if .Values.draDriver.controller.enabled -}}
+The mock-device DRA driver has been deployed.
+
+Controller: Running on all nodes as DaemonSet
+Node Agent: {{ if .Values.draDriver.nodeAgent.enabled }}Running on all nodes as DaemonSet{{ else }}Disabled{{ end }}
+{{- end }}
+
+{{ if .Values.kernelModule.enabled -}}
+Kernel Module: Enabled via KMM
+  Note: Requires KMM operator to be installed
+  Module will be loaded automatically on matching nodes
+{{- else -}}
+Kernel Module: Disabled
+  Note: You must load the mock-accel kernel module manually on each node
+{{- end }}
+
+To verify the installation:
+
+  # Check DaemonSets are running
+  kubectl get daemonset -n {{ include "mock-device.namespace" . }}
+
+  # Check ResourceSlices are published
+  kubectl get resourceslices -l driver={{ .Values.draDriver.name }}
+
+  # Check DeviceClasses are created
+  kubectl get deviceclass | grep mock-accel
+
+{{ if .Values.kernelModule.enabled -}}
+  # Check kernel module status
+  kubectl get module -n {{ include "mock-device.namespace" . }}
+{{- end }}
+
+To create a test ResourceClaim:
+
+  cat <<EOF | kubectl apply -f -
+  apiVersion: resource.k8s.io/v1
+  kind: ResourceClaim
+  metadata:
+    name: test-claim
+  spec:
+    devices:
+      requests:
+      - name: accel
+        deviceClassName: mock-accel-pf
+        count: 1
+  EOF
+
+For more information, visit:
+  {{ .Chart.Home }}

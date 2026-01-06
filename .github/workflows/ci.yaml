@@ -1,0 +1,197 @@
+name: CI
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+env:
+  GO_VERSION: "1.24"
+  REGISTRY: ghcr.io
+  IMAGE_PREFIX: ${{ github.repository_owner }}
+
+jobs:
+  # Job 1: Version detection
+  version:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.get_version.outputs.version }}
+      git_commit: ${{ steps.get_version.outputs.git_commit }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          submodules: recursive  # Full history for git describe
+
+      - name: Get version
+        id: get_version
+        run: |
+          if [ -f VERSION ]; then
+            VERSION=$(cat VERSION)
+          else
+            VERSION="0.0.0-dev"
+          fi
+          GIT_COMMIT=$(git rev-parse --short HEAD)
+
+          # For PRs, append PR number
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            VERSION="${VERSION}-pr${{ github.event.pull_request.number }}"
+          elif [ "${{ github.ref }}" = "refs/heads/main" ]; then
+            VERSION="${VERSION}-main"
+          fi
+
+          echo "version=${VERSION}" >> $GITHUB_OUTPUT
+          echo "git_commit=${GIT_COMMIT}" >> $GITHUB_OUTPUT
+          echo "Detected version: ${VERSION} (commit: ${GIT_COMMIT})"
+
+  # Job 2: Go linting and testing
+  go-test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+
+      - name: Download dependencies
+        working-directory: dra-driver
+        run: go mod download
+
+      - name: Run golangci-lint
+        uses: golangci/golangci-lint-action@v4
+        with:
+          version: latest
+          working-directory: dra-driver
+          args: --timeout=5m
+
+      - name: Run tests
+        working-directory: dra-driver
+        run: go test -v -race -coverprofile=coverage.out ./...
+
+      - name: Upload coverage
+        uses: codecov/codecov-action@v3
+        with:
+          files: ./dra-driver/coverage.out
+          flags: dra-driver
+
+  # Job 3: Build DRA driver image
+  build-dra-driver:
+    needs: [version, go-test]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to ghcr.io
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_PREFIX }}/mock-accel-dra-driver
+          tags: |
+            type=raw,value=${{ needs.version.outputs.version }}
+            type=raw,value=main,enable=${{ github.ref == 'refs/heads/main' }}
+            type=raw,value=pr-${{ github.event.pull_request.number }},enable=${{ github.event_name == 'pull_request' }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v5
+        with:
+          context: ./dra-driver
+          file: ./dra-driver/Dockerfile
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            VERSION=${{ needs.version.outputs.version }}
+            GIT_COMMIT=${{ needs.version.outputs.git_commit }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  # Job 4: Build kernel module image (matrix for distros)
+  build-kernel-module:
+    needs: [version]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      matrix:
+        distro:
+          - name: fc43
+            kernel_version: latest
+            base_image: registry.fedoraproject.org/fedora:43
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive  # Include libvfio-user
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to ghcr.io
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_PREFIX }}/mock-accel-module
+          tags: |
+            type=raw,value=${{ needs.version.outputs.version }}-${{ matrix.distro.name }}
+            type=raw,value=main-${{ matrix.distro.name }},enable=${{ github.ref == 'refs/heads/main' }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./Containerfile
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            VERSION=${{ needs.version.outputs.version }}
+            GIT_COMMIT=${{ needs.version.outputs.git_commit }}
+            KERNEL_VERSION=${{ matrix.distro.kernel_version }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  # Job 5: Helm chart linting
+  helm-lint:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Helm
+        uses: azure/setup-helm@v3
+        with:
+          version: v3.14.0
+
+      - name: Lint Helm chart
+        run: |
+          helm lint charts/mock-device
+          helm template test charts/mock-device --debug

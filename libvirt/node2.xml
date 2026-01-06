@@ -1,0 +1,110 @@
+<?xml version="1.0"?>
+<domain type='kvm' xmlns:qemu='http://libvirt.org/schemas/domain/qemu/1.0'>
+  <name>mock-cluster-node2</name>
+  <uuid>22222222-2222-2222-2222-222222222222</uuid>
+  <memory unit='GiB'>8</memory>
+  <currentMemory unit='GiB'>8</currentMemory>
+  <vcpu placement='static'>4</vcpu>
+
+  <!-- NUMA topology: 2 nodes, 2 cores each -->
+  <cpu mode='host-passthrough'>
+    <topology sockets='2' dies='1' cores='2' threads='1'/>
+    <numa>
+      <cell id='0' cpus='0-1' memory='4' unit='GiB'/>
+      <cell id='1' cpus='2-3' memory='4' unit='GiB'/>
+    </numa>
+  </cpu>
+
+  <os>
+    <type arch='x86_64' machine='q35'>hvm</type>
+    <boot dev='hd'/>
+  </os>
+
+  <features>
+    <acpi/>
+    <apic/>
+  </features>
+
+  <clock offset='utc'/>
+
+  <on_poweroff>destroy</on_poweroff>
+  <on_reboot>restart</on_reboot>
+  <on_crash>destroy</on_crash>
+
+  <devices>
+    <emulator>/usr/bin/qemu-system-x86_64</emulator>
+
+    <!-- Disk -->
+    <disk type='file' device='disk'>
+      <driver name='qemu' type='qcow2'/>
+      <source file='/var/lib/libvirt/images/node2.qcow2'/>
+      <target dev='vda' bus='virtio'/>
+    </disk>
+
+    <!-- Cloud-init seed -->
+    <disk type='file' device='disk'>
+      <driver name='qemu' type='raw'/>
+      <source file='/var/lib/libvirt/images/seed.iso'/>
+      <target dev='vdb' bus='virtio'/>
+      <readonly/>
+    </disk>
+
+    <!-- Network -->
+    <interface type='network'>
+      <mac address='52:54:00:22:22:02'/>
+      <source network='default'/>
+      <model type='virtio'/>
+    </interface>
+
+    <!-- Serial console -->
+    <serial type='pty'>
+      <target type='isa-serial' port='0'>
+        <model name='isa-serial'/>
+      </target>
+    </serial>
+    <console type='pty'>
+      <target type='serial' port='0'/>
+    </console>
+
+  </devices>
+
+  <!-- QEMU command line for NUMA topology and vfio-user devices -->
+  <qemu:commandline>
+    <!-- PCIe Expander Bridge for NUMA node 0 -->
+    <qemu:arg value='-device'/>
+    <qemu:arg value='pxb-pcie,bus_nr=16,id=pci.numa0,numa_node=0,bus=pcie.0,addr=0x10'/>
+
+    <!-- PCIe Expander Bridge for NUMA node 1 -->
+    <qemu:arg value='-device'/>
+    <qemu:arg value='pxb-pcie,bus_nr=32,id=pci.numa1,numa_node=1,bus=pcie.0,addr=0x11'/>
+
+    <!-- Root port on NUMA 0 expander -->
+    <qemu:arg value='-device'/>
+    <qemu:arg value='pcie-root-port,id=rp_n0,bus=pci.numa0,chassis=100'/>
+
+    <!-- Root port on NUMA 1 expander -->
+    <qemu:arg value='-device'/>
+    <qemu:arg value='pcie-root-port,id=rp_n1,bus=pci.numa1,chassis=101'/>
+
+    <!-- NUMA Node 0 devices: PF + 2 VFs -->
+    <qemu:arg value='-device'/>
+    <qemu:arg value='{"driver": "vfio-user-pci", "socket": {"path": "/tmp/numa-cluster-node2-numa0-pf.sock", "type": "unix"}, "bus": "rp_n0", "addr": "0.0", "multifunction": true}'/>
+
+    <qemu:arg value='-device'/>
+    <qemu:arg value='{"driver": "vfio-user-pci", "socket": {"path": "/tmp/numa-cluster-node2-numa0-vf0.sock", "type": "unix"}, "bus": "rp_n0", "addr": "0.1"}'/>
+
+    <qemu:arg value='-device'/>
+    <qemu:arg value='{"driver": "vfio-user-pci", "socket": {"path": "/tmp/numa-cluster-node2-numa0-vf1.sock", "type": "unix"}, "bus": "rp_n0", "addr": "0.2"}'/>
+
+    <!-- NUMA Node 1 devices: PF + 2 VFs -->
+    <qemu:arg value='-device'/>
+    <qemu:arg value='{"driver": "vfio-user-pci", "socket": {"path": "/tmp/numa-cluster-node2-numa1-pf.sock", "type": "unix"}, "bus": "rp_n1", "addr": "0.0", "multifunction": true}'/>
+
+    <qemu:arg value='-device'/>
+    <qemu:arg value='{"driver": "vfio-user-pci", "socket": {"path": "/tmp/numa-cluster-node2-numa1-vf0.sock", "type": "unix"}, "bus": "rp_n1", "addr": "0.1"}'/>
+
+    <qemu:arg value='-device'/>
+    <qemu:arg value='{"driver": "vfio-user-pci", "socket": {"path": "/tmp/numa-cluster-node2-numa1-vf1.sock", "type": "unix"}, "bus": "rp_n1", "addr": "0.2"}'/>
+  </qemu:commandline>
+
+</domain>

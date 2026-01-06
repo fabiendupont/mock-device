@@ -1,0 +1,19 @@
+apiVersion: v2
+name: mock-device
+description: Mock PCIe accelerator devices for Kubernetes DRA testing
+type: application
+version: 0.1.0
+appVersion: "0.1.0"
+keywords:
+  - kubernetes
+  - dra
+  - dynamic-resource-allocation
+  - testing
+  - pcie
+  - device-plugin
+home: https://github.com/fabiendupont/mock-device
+sources:
+  - https://github.com/fabiendupont/mock-device
+maintainers:
+  - name: Fabien Dupont
+    email: fdupont@redhat.com

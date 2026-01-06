@@ -1,0 +1,62 @@
+# Basic Device Allocation Example
+#
+# Use Case: Allocate a single mock-accel device to a pod
+#
+# Expected Result:
+# - Pod receives one mock-accel device (either PF or VF)
+# - Container environment has MOCK_ACCEL_* variables set
+# - Container can read device sysfs at /sys/class/mock-accel/<device>
+#
+# Testing Instructions:
+# 1. Apply this file: kubectl apply -f basic-allocation.yaml
+# 2. Wait for pod to be Running: kubectl wait --for=condition=Ready pod/basic-allocation-test --timeout=60s
+# 3. Check device environment: kubectl exec basic-allocation-test -- env | grep MOCK_ACCEL
+# 4. Verify sysfs access: kubectl exec basic-allocation-test -- ls /sys/class/mock-accel/
+# 5. Read device properties: kubectl exec basic-allocation-test -- cat /sys/class/mock-accel/*/uuid
+# 6. Cleanup: kubectl delete -f basic-allocation.yaml
+
+---
+apiVersion: resource.k8s.io/v1
+kind: ResourceClaim
+metadata:
+  name: basic-claim
+spec:
+  devices:
+    requests:
+    - name: accel
+      deviceClassName: mock-accel-pf
+      count: 1
+
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: basic-allocation-test
+spec:
+  resourceClaims:
+  - name: accel
+    resourceClaimName: basic-claim
+  containers:
+  - name: app
+    image: busybox:latest
+    command:
+    - sh
+    - -c
+    - |
+      echo "=== Mock Accelerator Device Allocated ==="
+      echo "Device UUID: $MOCK_ACCEL_UUID"
+      echo "Device PCI:  $MOCK_ACCEL_PCI"
+      echo "Device Name: $MOCK_ACCEL_DEVICE"
+      echo ""
+      echo "=== Device Properties from sysfs ==="
+      cat /sys/class/mock-accel/$MOCK_ACCEL_DEVICE/uuid
+      cat /sys/class/mock-accel/$MOCK_ACCEL_DEVICE/memory_size
+      cat /sys/class/mock-accel/$MOCK_ACCEL_DEVICE/numa_node
+      cat /sys/class/mock-accel/$MOCK_ACCEL_DEVICE/capabilities
+      echo ""
+      echo "=== Sleeping for 1 hour (for interactive testing) ==="
+      sleep 3600
+    resources:
+      claims:
+      - name: accel
+  restartPolicy: Never

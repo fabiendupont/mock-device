@@ -1,0 +1,219 @@
+# E2E Integration Test for mock-accel DRA Driver
+#
+# This test validates the complete allocation flow:
+# 1. ResourceSlice published by controller
+# 2. ResourceClaim created and scheduled
+# 3. Node agent allocates device (writes status register)
+# 4. CDI spec generated
+# 5. Pod receives device access (env vars + sysfs mount)
+# 6. Device deallocated on pod termination
+
+---
+apiVersion: resource.k8s.io/v1
+kind: ResourceClaim
+metadata:
+  name: test-pf-claim
+  namespace: default
+spec:
+  devices:
+    requests:
+    - name: pf-device
+      deviceClassName: mock-accel-pf
+      count: 1
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: test-mock-accel-pf
+  namespace: default
+spec:
+  resourceClaims:
+  - name: accel
+    resourceClaimName: test-pf-claim
+  containers:
+  - name: test
+    image: busybox:latest
+    command:
+    - sh
+    - -c
+    - |
+      set -e
+      echo "=== Mock Accel Device Test ==="
+
+      # Verify environment variables are set
+      echo "Checking environment variables..."
+      if [ -z "$MOCK_ACCEL_UUID" ]; then
+        echo "ERROR: MOCK_ACCEL_UUID not set"
+        exit 1
+      fi
+      echo "✓ MOCK_ACCEL_UUID: $MOCK_ACCEL_UUID"
+
+      if [ -z "$MOCK_ACCEL_PCI" ]; then
+        echo "ERROR: MOCK_ACCEL_PCI not set"
+        exit 1
+      fi
+      echo "✓ MOCK_ACCEL_PCI: $MOCK_ACCEL_PCI"
+
+      if [ -z "$MOCK_ACCEL_DEVICE" ]; then
+        echo "ERROR: MOCK_ACCEL_DEVICE not set"
+        exit 1
+      fi
+      echo "✓ MOCK_ACCEL_DEVICE: $MOCK_ACCEL_DEVICE"
+
+      # Verify sysfs mount exists
+      echo ""
+      echo "Checking sysfs device directory..."
+      DEVICE_PATH="/sys/class/mock-accel/$MOCK_ACCEL_DEVICE"
+      if [ ! -d "$DEVICE_PATH" ]; then
+        echo "ERROR: Device path $DEVICE_PATH not found"
+        exit 1
+      fi
+      echo "✓ Device directory exists: $DEVICE_PATH"
+
+      # Verify we can read device attributes
+      echo ""
+      echo "Reading device attributes..."
+      UUID_FILE="$DEVICE_PATH/uuid"
+      if [ ! -f "$UUID_FILE" ]; then
+        echo "ERROR: UUID file not found"
+        exit 1
+      fi
+      DEVICE_UUID=$(cat "$UUID_FILE")
+      echo "✓ Device UUID: $DEVICE_UUID"
+
+      if [ "$DEVICE_UUID" != "$MOCK_ACCEL_UUID" ]; then
+        echo "ERROR: UUID mismatch: env=$MOCK_ACCEL_UUID file=$DEVICE_UUID"
+        exit 1
+      fi
+      echo "✓ UUID matches environment variable"
+
+      MEMORY_FILE="$DEVICE_PATH/memory_size"
+      if [ -f "$MEMORY_FILE" ]; then
+        MEMORY_SIZE=$(cat "$MEMORY_FILE")
+        echo "✓ Memory size: $MEMORY_SIZE bytes"
+      fi
+
+      CAPS_FILE="$DEVICE_PATH/capabilities"
+      if [ -f "$CAPS_FILE" ]; then
+        CAPABILITIES=$(cat "$CAPS_FILE")
+        echo "✓ Capabilities: $CAPABILITIES"
+      fi
+
+      # List all available attributes
+      echo ""
+      echo "Available device attributes:"
+      ls -la "$DEVICE_PATH/" | grep -v "^d" | grep -v "^total"
+
+      echo ""
+      echo "=== All Tests Passed ==="
+      echo "Sleeping for 30 seconds before exit..."
+      sleep 30
+    resources:
+      claims:
+      - name: accel
+  restartPolicy: Never
+
+---
+# Test with Virtual Function
+apiVersion: resource.k8s.io/v1
+kind: ResourceClaim
+metadata:
+  name: test-vf-claim
+  namespace: default
+spec:
+  devices:
+    requests:
+    - name: vf-device
+      deviceClassName: mock-accel-vf
+      count: 1
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: test-mock-accel-vf
+  namespace: default
+spec:
+  resourceClaims:
+  - name: accel
+    resourceClaimName: test-vf-claim
+  containers:
+  - name: test
+    image: busybox:latest
+    command:
+    - sh
+    - -c
+    - |
+      set -e
+      echo "=== Mock Accel VF Device Test ==="
+      echo "UUID: $MOCK_ACCEL_UUID"
+      echo "PCI: $MOCK_ACCEL_PCI"
+      echo "Device: $MOCK_ACCEL_DEVICE"
+
+      # For VFs, verify we can read the device attributes
+      DEVICE_PATH="/sys/class/mock-accel/$MOCK_ACCEL_DEVICE"
+      if [ -d "$DEVICE_PATH" ]; then
+        echo "Device path exists: $DEVICE_PATH"
+        cat "$DEVICE_PATH/uuid" || true
+        cat "$DEVICE_PATH/memory_size" || true
+      fi
+
+      echo "VF test completed successfully"
+      sleep 30
+    resources:
+      claims:
+      - name: accel
+  restartPolicy: Never
+
+---
+# Test with memory requirement (2GB VF)
+apiVersion: resource.k8s.io/v1
+kind: ResourceClaim
+metadata:
+  name: test-vf-2gb-claim
+  namespace: default
+spec:
+  devices:
+    requests:
+    - name: vf-2gb-device
+      deviceClassName: mock-accel-vf-2gb
+      count: 1
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: test-mock-accel-vf-2gb
+  namespace: default
+spec:
+  resourceClaims:
+  - name: accel
+    resourceClaimName: test-vf-2gb-claim
+  containers:
+  - name: test
+    image: busybox:latest
+    command:
+    - sh
+    - -c
+    - |
+      set -e
+      echo "=== Mock Accel VF 2GB Device Test ==="
+      echo "UUID: $MOCK_ACCEL_UUID"
+      echo "PCI: $MOCK_ACCEL_PCI"
+      echo "Device: $MOCK_ACCEL_DEVICE"
+
+      DEVICE_PATH="/sys/class/mock-accel/$MOCK_ACCEL_DEVICE"
+      MEMORY_SIZE=$(cat "$DEVICE_PATH/memory_size")
+      echo "Memory size: $MEMORY_SIZE bytes"
+
+      # Verify memory is at least 2GB (2147483648 bytes)
+      MIN_MEMORY=2147483648
+      if [ "$MEMORY_SIZE" -lt "$MIN_MEMORY" ]; then
+        echo "ERROR: Memory size $MEMORY_SIZE is less than required $MIN_MEMORY"
+        exit 1
+      fi
+      echo "✓ Memory requirement satisfied"
+
+      sleep 30
+    resources:
+      claims:
+      - name: accel
+  restartPolicy: Never

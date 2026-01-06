@@ -1,0 +1,141 @@
+# Example 1: Meta-DRA selects 2 devices on same PCIe bus for low-latency workload
+# The meta-DRA driver analyzed topology and chose devices mock3 and mock4
+# because they're on the same PCIe bus (0x11) and NUMA node (0)
+---
+apiVersion: resource.k8s.io/v1
+kind: ResourceClaim
+metadata:
+  name: meta-dra-pcie-locality
+  namespace: default
+  labels:
+    meta-dra.k8s.io/coordinated: "true"
+    meta-dra.k8s.io/topology: "pcie-same-bus"
+spec:
+  devices:
+    requests:
+    - name: device-0
+      exactly:
+        deviceClassName: mock-accel-pf
+        count: 1
+        selectors:
+        - cel:
+            # Meta-DRA specifies exact device based on PCIe topology analysis
+            expression: |
+              device.attributes["mock-accel.example.com"].numaNode == 0 &&
+              device.attributes["mock-accel.example.com"].pciAddress == "0000:11:00.0"
+
+    - name: device-1
+      exactly:
+        deviceClassName: mock-accel-pf
+        count: 1
+        selectors:
+        - cel:
+            # Second device on same PCIe bus (0x11) for locality
+            expression: |
+              device.attributes["mock-accel.example.com"].numaNode == 0 &&
+              device.attributes["mock-accel.example.com"].pciAddress == "0000:11:00.1"
+
+    # Constraints ensure both devices allocated together or not at all
+    constraints:
+    - requests: ["device-0", "device-1"]
+      matchAttribute: numaNode
+
+---
+# Pod using the meta-DRA coordinated claim
+apiVersion: v1
+kind: Pod
+metadata:
+  name: pcie-locality-workload
+  namespace: default
+spec:
+  resourceClaims:
+  - name: accelerators
+    resourceClaimName: meta-dra-pcie-locality
+
+  containers:
+  - name: workload
+    image: busybox
+    command:
+    - sh
+    - -c
+    - |
+      echo "=== Allocated Accelerators ==="
+      env | grep MOCK_ACCEL | sort
+      echo ""
+      echo "=== Device Topology ==="
+      ls -l /sys/class/mock-accel/ || echo "sysfs not mounted"
+      echo ""
+      echo "Sleeping for testing..."
+      sleep 3600
+    resources:
+      claims:
+      - name: accelerators
+        request: device-0
+      - name: accelerators
+        request: device-1
+
+---
+# Example 2: Meta-DRA selects devices across NUMA nodes for memory bandwidth
+# Meta-DRA chose one device from each NUMA node to maximize memory bandwidth
+apiVersion: resource.k8s.io/v1
+kind: ResourceClaim
+metadata:
+  name: meta-dra-numa-spread
+  namespace: default
+  labels:
+    meta-dra.k8s.io/coordinated: "true"
+    meta-dra.k8s.io/topology: "numa-spread"
+spec:
+  devices:
+    requests:
+    - name: numa0-device
+      exactly:
+        deviceClassName: mock-accel-pf
+        count: 1
+        selectors:
+        - cel:
+            # Device from NUMA node 0
+            expression: |
+              device.attributes["mock-accel.example.com"].numaNode == 0 &&
+              device.attributes["mock-accel.example.com"].pciAddress == "0000:11:00.0"
+
+    - name: numa1-device
+      exactly:
+        deviceClassName: mock-accel-pf
+        count: 1
+        selectors:
+        - cel:
+            # Device from NUMA node 1 for memory bandwidth
+            expression: |
+              device.attributes["mock-accel.example.com"].numaNode == 1 &&
+              device.attributes["mock-accel.example.com"].pciAddress == "0000:21:00.0"
+
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: numa-spread-workload
+  namespace: default
+spec:
+  resourceClaims:
+  - name: accelerators
+    resourceClaimName: meta-dra-numa-spread
+
+  containers:
+  - name: workload
+    image: busybox
+    command:
+    - sh
+    - -c
+    - |
+      echo "=== NUMA-spread Allocation ==="
+      env | grep MOCK_ACCEL | sort
+      echo ""
+      echo "Device 0 should be on NUMA 0, Device 1 on NUMA 1"
+      sleep 3600
+    resources:
+      claims:
+      - name: accelerators
+        request: numa0-device
+      - name: accelerators
+        request: numa1-device

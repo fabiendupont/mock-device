@@ -1,0 +1,141 @@
+# SR-IOV VF Allocation Example
+#
+# Use Case: Allocate multiple Virtual Functions (VFs) from the same Physical Function (PF)
+#
+# Expected Result:
+# - Pod receives 2 VF devices from the same parent PF
+# - Both VFs have the same physfn attribute
+# - Container can verify VF relationship via sysfs
+#
+# Prerequisites:
+# - SR-IOV must be enabled on at least one PF device
+# - Enable VFs by SSH into a node and running:
+#   echo 2 | sudo tee /sys/class/mock-accel/mock0/sriov_numvfs
+# - Wait for ResourceSlices to update with VF devices
+#
+# Testing Instructions:
+# 1. Enable VFs on a node:
+#    sshpass -p "test123" ssh fedora@<node-ip> "echo 2 | sudo tee /sys/class/mock-accel/mock0/sriov_numvfs"
+# 2. Verify VFs appeared:
+#    sshpass -p "test123" ssh fedora@<node-ip> "ls /sys/class/mock-accel/ | grep vf"
+# 3. Wait for ResourceSlices to update:
+#    kubectl get resourceslices | grep _vf
+# 4. Apply this file: kubectl apply -f sriov-vf-allocation.yaml
+# 5. Wait for pod to be Running: kubectl wait --for=condition=Ready pod/sriov-vf-test --timeout=60s
+# 6. Check allocated VFs: kubectl exec sriov-vf-test -- env | grep MOCK_ACCEL
+# 7. Verify VF parent relationship:
+#    kubectl exec sriov-vf-test -- sh -c 'for d in /sys/class/mock-accel/*; do echo "$(basename $d) -> physfn: $(cat $d/device/physfn 2>/dev/null | xargs basename || echo N/A)"; done'
+# 8. Cleanup:
+#    kubectl delete -f sriov-vf-allocation.yaml
+#    sshpass -p "test123" ssh fedora@<node-ip> "echo 0 | sudo tee /sys/class/mock-accel/mock0/sriov_numvfs"
+
+---
+apiVersion: resource.k8s.io/v1
+kind: ResourceClaim
+metadata:
+  name: sriov-vf-claim
+spec:
+  devices:
+    requests:
+    - name: vf-0
+      deviceClassName: mock-accel-vf
+      count: 1
+      selectors:
+      # Select VFs from parent PF "mock0"
+      - cel:
+          expression: |
+            device.attributes["mock-accel.example.com/deviceType"].stringValue == "vf" &&
+            device.attributes["mock-accel.example.com/physfn"].stringValue == "mock0"
+    - name: vf-1
+      deviceClassName: mock-accel-vf
+      count: 1
+      selectors:
+      # Select VFs from parent PF "mock0"
+      - cel:
+          expression: |
+            device.attributes["mock-accel.example.com/deviceType"].stringValue == "vf" &&
+            device.attributes["mock-accel.example.com/physfn"].stringValue == "mock0"
+    constraints:
+    # Ensure both VFs are from the same parent PF
+    - requests: ["vf-0", "vf-1"]
+      matchAttribute: mock-accel.example.com/physfn
+
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: sriov-vf-test
+spec:
+  resourceClaims:
+  - name: vfs
+    resourceClaimName: sriov-vf-claim
+  containers:
+  - name: app
+    image: busybox:latest
+    command:
+    - sh
+    - -c
+    - |
+      echo "=== SR-IOV VF Allocation Test ==="
+      echo ""
+      echo "=== Allocated VF Devices ==="
+      env | grep MOCK_ACCEL | sort
+      echo ""
+
+      echo "=== VF Device Details ==="
+      for device_dir in /sys/class/mock-accel/*; do
+        device=$(basename "$device_dir")
+        uuid=$(cat "$device_dir/uuid")
+        pci_path=$(readlink "$device_dir/device")
+        pci=$(basename "$pci_path")
+        numa=$(cat "$device_dir/numa_node")
+        memory=$(cat "$device_dir/memory_size")
+        memory_gb=$((memory / 1024 / 1024 / 1024))
+
+        # Check if device is a VF by checking for physfn symlink
+        if [ -L "$device_dir/device/physfn" ]; then
+          physfn_path=$(readlink "$device_dir/device/physfn")
+          physfn_pci=$(basename "$physfn_path")
+          device_type="VF"
+        else
+          physfn_pci="N/A"
+          device_type="PF"
+        fi
+
+        echo "Device: $device ($device_type)"
+        echo "  UUID:       $uuid"
+        echo "  PCI:        $pci"
+        echo "  Parent PF:  $physfn_pci"
+        echo "  NUMA:       $numa"
+        echo "  Memory:     ${memory_gb}GB"
+        echo ""
+      done
+
+      echo "=== VF Parent Relationship Check ==="
+      # Extract parent PF from all VFs
+      unique_parents=$(cat /sys/class/mock-accel/*/device/physfn 2>/dev/null | xargs -n1 basename | sort -u | wc -l)
+
+      if [ -z "$unique_parents" ] || [ "$unique_parents" -eq 0 ]; then
+        echo "✗ FAILED: No VF devices found"
+      elif [ "$unique_parents" -eq 1 ]; then
+        parent=$(cat /sys/class/mock-accel/*/device/physfn 2>/dev/null | head -1 | xargs basename)
+        echo "✓ SUCCESS: All VFs from same parent PF ($parent)"
+      else
+        echo "✗ FAILED: VFs from multiple parent PFs ($unique_parents different parents)"
+      fi
+      echo ""
+
+      echo "=== Device Capabilities ==="
+      for device_dir in /sys/class/mock-accel/*; do
+        device=$(basename "$device_dir")
+        caps=$(cat "$device_dir/capabilities")
+        echo "$device: $caps"
+      done
+      echo ""
+
+      echo "=== Sleeping for 1 hour (for interactive testing) ==="
+      sleep 3600
+    resources:
+      claims:
+      - name: vfs
+  restartPolicy: Never

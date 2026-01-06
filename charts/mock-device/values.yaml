@@ -1,0 +1,162 @@
+# Default values for mock-device
+# This is a YAML-formatted file.
+# Declare variables to be passed into your templates.
+
+# Global settings
+global:
+  # Image pull secrets for private registries
+  imagePullSecrets: []
+
+# Namespace configuration
+namespace:
+  # Create the namespace
+  create: true
+  # Namespace name
+  name: mock-device
+
+# DRA Driver configuration
+draDriver:
+  # Driver name (must match what devices report)
+  name: mock-accel.example.com
+
+  # Controller configuration
+  controller:
+    # Enable controller deployment
+    enabled: true
+
+    # Container image settings
+    image:
+      repository: ghcr.io/fabiendupont/mock-accel-dra-driver
+      # Overrides the image tag (default is Chart.appVersion)
+      tag: ""
+      pullPolicy: IfNotPresent
+
+    # Rescan interval for device discovery
+    rescanInterval: 30s
+
+    # Log verbosity (0-10, higher = more verbose)
+    verbosity: 5
+
+    # Resource limits and requests
+    resources:
+      requests:
+        cpu: 100m
+        memory: 128Mi
+      limits:
+        cpu: 200m
+        memory: 256Mi
+
+    # Node selector
+    nodeSelector: {}
+
+    # Tolerations
+    tolerations: []
+
+    # Affinity
+    affinity: {}
+
+  # Node Agent configuration
+  nodeAgent:
+    # Enable node agent deployment
+    enabled: true
+
+    # Container image settings
+    image:
+      repository: ghcr.io/fabiendupont/mock-accel-dra-driver
+      # Overrides the image tag (default is Chart.appVersion)
+      tag: ""
+      pullPolicy: IfNotPresent
+
+    # Log verbosity (0-10, higher = more verbose)
+    verbosity: 5
+
+    # Kubelet plugin socket path
+    pluginSocket: /var/lib/kubelet/plugins/mock-accel.example.com
+
+    # Resource limits and requests
+    resources:
+      requests:
+        cpu: 100m
+        memory: 128Mi
+      limits:
+        cpu: 200m
+        memory: 256Mi
+
+    # Security context (requires privileged for sysfs write)
+    securityContext:
+      privileged: true
+      runAsUser: 0
+
+    # Node selector
+    nodeSelector: {}
+
+    # Tolerations
+    tolerations: []
+
+    # Affinity
+    affinity: {}
+
+# Kernel Module configuration (via KMM)
+kernelModule:
+  # Enable kernel module deployment via KMM
+  enabled: false
+
+  # Module name
+  moduleName: mock-accel
+
+  # Container image settings
+  image:
+    repository: ghcr.io/fabiendupont/mock-accel-module
+    tag: v0.1.0
+    pullPolicy: IfNotPresent
+
+  # Kernel mappings for different distributions
+  kernelMappings:
+    - regexp: '^.*\.fc43\.x86_64$'
+      containerImage: "ghcr.io/fabiendupont/mock-accel-module:v1.0.0-fc43"
+
+  # Node selector for module deployment
+  nodeSelector:
+    kubernetes.io/os: linux
+
+# Device Classes configuration
+deviceClasses:
+  # Physical Functions only
+  - name: mock-accel-pf
+    enabled: true
+    selector:
+      cel: 'device.attributes["mock-accel.example.com"].deviceType == "pf"'
+
+  # Virtual Functions only
+  - name: mock-accel-vf
+    enabled: true
+    selector:
+      cel: 'device.attributes["mock-accel.example.com"].deviceType == "vf"'
+
+  # VFs with at least 2GB memory (example)
+  - name: mock-accel-vf-2gb
+    enabled: false
+    selector:
+      cel: 'device.attributes["mock-accel.example.com"].deviceType == "vf"'
+
+  # NUMA 0 devices (example)
+  - name: mock-accel-numa0
+    enabled: false
+    selector:
+      cel: 'device.attributes["mock-accel.example.com"].deviceType == "pf"'
+
+# RBAC configuration
+rbac:
+  # Create RBAC resources
+  create: true
+
+# ServiceAccount configuration
+serviceAccount:
+  # Create service accounts
+  create: true
+  # Annotations to add to service accounts
+  annotations: {}
+
+# Name overrides
+nameOverride: ""
+fullnameOverride: ""

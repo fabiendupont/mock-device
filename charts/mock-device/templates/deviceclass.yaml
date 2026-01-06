@@ -1,0 +1,15 @@
+{{- range .Values.deviceClasses }}
+{{- if .enabled }}
+---
+apiVersion: resource.k8s.io/v1
+kind: DeviceClass
+metadata:
+  name: {{ .name }}
+  labels:
+    {{- include "mock-device.labels" $ | nindent 4 }}
+spec:
+  selectors:
+  - cel:
+      expression: {{ .selector.cel }}
+{{- end }}
+{{- end }}

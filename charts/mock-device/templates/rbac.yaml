@@ -1,0 +1,92 @@
+{{- if .Values.rbac.create }}
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ include "mock-device.controller.serviceAccountName" . }}
+  namespace: {{ include "mock-device.namespace" . }}
+  labels:
+    {{- include "mock-device.controller.labels" . | nindent 4 }}
+  {{- with .Values.serviceAccount.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ include "mock-device.fullname" . }}-controller
+  labels:
+    {{- include "mock-device.controller.labels" . | nindent 4 }}
+rules:
+- apiGroups: ["resource.k8s.io"]
+  resources: ["resourceslices"]
+  verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+- apiGroups: ["resource.k8s.io"]
+  resources: ["resourceclaims"]
+  verbs: ["get", "list", "watch"]
+- apiGroups: [""]
+  resources: ["nodes"]
+  verbs: ["get", "list", "watch"]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ include "mock-device.fullname" . }}-controller
+  labels:
+    {{- include "mock-device.controller.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ include "mock-device.fullname" . }}-controller
+subjects:
+- kind: ServiceAccount
+  name: {{ include "mock-device.controller.serviceAccountName" . }}
+  namespace: {{ include "mock-device.namespace" . }}
+
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ include "mock-device.nodeAgent.serviceAccountName" . }}
+  namespace: {{ include "mock-device.namespace" . }}
+  labels:
+    {{- include "mock-device.nodeAgent.labels" . | nindent 4 }}
+  {{- with .Values.serviceAccount.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ include "mock-device.fullname" . }}-node-agent
+  labels:
+    {{- include "mock-device.nodeAgent.labels" . | nindent 4 }}
+rules:
+- apiGroups: [""]
+  resources: ["pods"]
+  verbs: ["get"]
+- apiGroups: ["resource.k8s.io"]
+  resources: ["resourceclaims", "resourceclaimstatuses"]
+  verbs: ["get", "list", "watch", "update", "patch"]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ include "mock-device.fullname" . }}-node-agent
+  labels:
+    {{- include "mock-device.nodeAgent.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ include "mock-device.fullname" . }}-node-agent
+subjects:
+- kind: ServiceAccount
+  name: {{ include "mock-device.nodeAgent.serviceAccountName" . }}
+  namespace: {{ include "mock-device.namespace" . }}
+{{- end }}

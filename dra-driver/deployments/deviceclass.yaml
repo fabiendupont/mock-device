@@ -1,0 +1,40 @@
+---
+apiVersion: resource.k8s.io/v1
+kind: DeviceClass
+metadata:
+  name: mock-accel-pf
+spec:
+  selectors:
+  - cel:
+      expression: device.attributes["mock-accel.example.com"].deviceType == "pf"
+
+---
+apiVersion: resource.k8s.io/v1
+kind: DeviceClass
+metadata:
+  name: mock-accel-vf
+spec:
+  selectors:
+  - cel:
+      expression: device.attributes["mock-accel.example.com"].deviceType == "vf"
+
+---
+apiVersion: resource.k8s.io/v1
+kind: DeviceClass
+metadata:
+  name: mock-accel-vf-2gb
+spec:
+  selectors:
+  - cel:
+      expression: device.attributes["mock-accel.example.com"].deviceType == "vf"
+
+---
+apiVersion: resource.k8s.io/v1
+kind: DeviceClass
+metadata:
+  name: mock-accel-numa0
+spec:
+  selectors:
+  - cel:
+      expression: device.attributes["mock-accel.example.com"].deviceType == "pf"
+  # Note: NUMA affinity handled via pool selection by scheduler

@@ -1,0 +1,98 @@
+# NUMA Locality Example
+#
+# Use Case: Allocate multiple devices on the same NUMA node for optimal memory locality
+#
+# Expected Result:
+# - Pod receives 2 mock-accel devices from the same NUMA node
+# - Both devices share the same NUMA node value
+# - Container can verify NUMA locality via sysfs
+#
+# Testing Instructions:
+# 1. Apply this file: kubectl apply -f numa-locality.yaml
+# 2. Wait for pod to be Running: kubectl wait --for=condition=Ready pod/numa-locality-test --timeout=60s
+# 3. Check allocated devices: kubectl exec numa-locality-test -- env | grep MOCK_ACCEL
+# 4. Verify NUMA nodes match:
+#    kubectl exec numa-locality-test -- sh -c 'cat /sys/class/mock-accel/*/numa_node | sort -u | wc -l'
+#    # Should output "1" (all devices on same NUMA node)
+# 5. Verify device properties:
+#    kubectl exec numa-locality-test -- sh -c 'for d in /sys/class/mock-accel/*; do echo "Device: $(basename $d), NUMA: $(cat $d/numa_node)"; done'
+# 6. Cleanup: kubectl delete -f numa-locality.yaml
+
+---
+apiVersion: resource.k8s.io/v1
+kind: ResourceClaim
+metadata:
+  name: numa-locality-claim
+spec:
+  devices:
+    requests:
+    - name: device-0
+      deviceClassName: mock-accel-pf
+      count: 1
+    - name: device-1
+      deviceClassName: mock-accel-pf
+      count: 1
+    constraints:
+    # Ensure both devices are on the same NUMA node
+    - requests: ["device-0", "device-1"]
+      matchAttribute: mock-accel.example.com/numaNode
+
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: numa-locality-test
+spec:
+  resourceClaims:
+  - name: devices
+    resourceClaimName: numa-locality-claim
+  containers:
+  - name: app
+    image: busybox:latest
+    command:
+    - sh
+    - -c
+    - |
+      echo "=== NUMA Locality Test ==="
+      echo ""
+      echo "=== Allocated Devices ==="
+      env | grep MOCK_ACCEL | sort
+      echo ""
+
+      echo "=== NUMA Node Verification ==="
+      for device_dir in /sys/class/mock-accel/*; do
+        device=$(basename "$device_dir")
+        numa=$(cat "$device_dir/numa_node")
+        uuid=$(cat "$device_dir/uuid")
+        pci=$(readlink "$device_dir/device" | xargs basename)
+        echo "Device: $device"
+        echo "  UUID: $uuid"
+        echo "  PCI:  $pci"
+        echo "  NUMA: $numa"
+        echo ""
+      done
+
+      echo "=== NUMA Locality Check ==="
+      unique_numa=$(cat /sys/class/mock-accel/*/numa_node | sort -u | wc -l)
+      if [ "$unique_numa" -eq 1 ]; then
+        echo "✓ SUCCESS: All devices on same NUMA node"
+      else
+        echo "✗ FAILED: Devices span multiple NUMA nodes ($unique_numa different nodes)"
+      fi
+      echo ""
+
+      echo "=== Memory Sizes ==="
+      for device_dir in /sys/class/mock-accel/*; do
+        device=$(basename "$device_dir")
+        memory=$(cat "$device_dir/memory_size")
+        memory_gb=$((memory / 1024 / 1024 / 1024))
+        echo "$device: ${memory_gb}GB"
+      done
+      echo ""
+
+      echo "=== Sleeping for 1 hour (for interactive testing) ==="
+      sleep 3600
+    resources:
+      claims:
+      - name: devices
+  restartPolicy: Never

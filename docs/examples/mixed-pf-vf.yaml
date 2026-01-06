@@ -1,0 +1,163 @@
+# Mixed PF and VF Allocation Example
+#
+# Use Case: Allocate both Physical Function (PF) and Virtual Function (VF) devices to the same pod
+#
+# Expected Result:
+# - Pod receives 1 PF device and 1 VF device
+# - Container can distinguish between PF and VF via device type
+# - Both devices are accessible via sysfs
+#
+# Prerequisites:
+# - SR-IOV must be enabled on at least one PF device
+# - Enable VFs by SSH into a node and running:
+#   echo 2 | sudo tee /sys/class/mock-accel/mock0/sriov_numvfs
+# - Wait for ResourceSlices to update with VF devices
+#
+# Testing Instructions:
+# 1. Enable VFs on a node:
+#    sshpass -p "test123" ssh fedora@<node-ip> "echo 2 | sudo tee /sys/class/mock-accel/mock0/sriov_numvfs"
+# 2. Verify VFs appeared:
+#    sshpass -p "test123" ssh fedora@<node-ip> "ls /sys/class/mock-accel/ | grep vf"
+# 3. Apply this file: kubectl apply -f mixed-pf-vf.yaml
+# 4. Wait for pod to be Running: kubectl wait --for=condition=Ready pod/mixed-device-test --timeout=60s
+# 5. Check allocated devices: kubectl exec mixed-device-test -- env | grep MOCK_ACCEL
+# 6. Verify device types:
+#    kubectl exec mixed-device-test -- sh -c 'for d in /sys/class/mock-accel/*; do echo "$(basename $d): $([ -L $d/device/physfn ] && echo VF || echo PF)"; done'
+# 7. Cleanup:
+#    kubectl delete -f mixed-pf-vf.yaml
+#    sshpass -p "test123" ssh fedora@<node-ip> "echo 0 | sudo tee /sys/class/mock-accel/mock0/sriov_numvfs"
+
+---
+apiVersion: resource.k8s.io/v1
+kind: ResourceClaim
+metadata:
+  name: mixed-devices-claim
+spec:
+  devices:
+    requests:
+    - name: pf-device
+      deviceClassName: mock-accel-pf
+      count: 1
+      selectors:
+      # Explicitly select a PF device
+      - cel:
+          expression: device.attributes["mock-accel.example.com/deviceType"].stringValue == "pf"
+    - name: vf-device
+      deviceClassName: mock-accel-vf
+      count: 1
+      selectors:
+      # Explicitly select a VF device
+      - cel:
+          expression: device.attributes["mock-accel.example.com/deviceType"].stringValue == "vf"
+
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: mixed-device-test
+spec:
+  resourceClaims:
+  - name: devices
+    resourceClaimName: mixed-devices-claim
+  containers:
+  - name: app
+    image: busybox:latest
+    command:
+    - sh
+    - -c
+    - |
+      echo "=== Mixed PF and VF Allocation Test ==="
+      echo ""
+      echo "=== Allocated Devices ==="
+      env | grep MOCK_ACCEL | sort
+      echo ""
+
+      pf_count=0
+      vf_count=0
+
+      echo "=== Device Classification ==="
+      for device_dir in /sys/class/mock-accel/*; do
+        device=$(basename "$device_dir")
+        uuid=$(cat "$device_dir/uuid")
+        pci_path=$(readlink "$device_dir/device")
+        pci=$(basename "$pci_path")
+        numa=$(cat "$device_dir/numa_node")
+        memory=$(cat "$device_dir/memory_size")
+        memory_gb=$((memory / 1024 / 1024 / 1024))
+        caps=$(cat "$device_dir/capabilities")
+
+        # Determine device type by checking for physfn symlink
+        if [ -L "$device_dir/device/physfn" ]; then
+          physfn_path=$(readlink "$device_dir/device/physfn")
+          physfn_pci=$(basename "$physfn_path")
+          device_type="VF"
+          vf_count=$((vf_count + 1))
+          parent_info="Parent PF:  $physfn_pci"
+        else
+          device_type="PF"
+          pf_count=$((pf_count + 1))
+          parent_info="Parent PF:  N/A (this is a PF)"
+
+          # Check if PF has VFs enabled
+          if [ -f "$device_dir/device/sriov_numvfs" ]; then
+            numvfs=$(cat "$device_dir/device/sriov_numvfs" 2>/dev/null || echo 0)
+            totalvfs=$(cat "$device_dir/device/sriov_totalvfs" 2>/dev/null || echo 0)
+            parent_info="$parent_info
+  SR-IOV:     $numvfs/$totalvfs VFs enabled"
+          fi
+        fi
+
+        echo "Device: $device ($device_type)"
+        echo "  UUID:       $uuid"
+        echo "  PCI:        $pci"
+        echo "  NUMA:       $numa"
+        echo "  Memory:     ${memory_gb}GB"
+        echo "  Caps:       $caps"
+        echo "  $parent_info"
+        echo ""
+      done
+
+      echo "=== Device Type Summary ==="
+      total_devices=$((pf_count + vf_count))
+      echo "Total Devices: $total_devices"
+      echo "  PF Devices:  $pf_count"
+      echo "  VF Devices:  $vf_count"
+      echo ""
+
+      echo "=== Allocation Verification ==="
+      if [ "$pf_count" -ge 1 ] && [ "$vf_count" -ge 1 ]; then
+        echo "✓ SUCCESS: Mixed allocation (PF + VF) successful"
+      elif [ "$pf_count" -gt 0 ] && [ "$vf_count" -eq 0 ]; then
+        echo "✗ FAILED: Only PF devices allocated (no VFs)"
+      elif [ "$pf_count" -eq 0 ] && [ "$vf_count" -gt 0 ]; then
+        echo "✗ FAILED: Only VF devices allocated (no PFs)"
+      else
+        echo "✗ FAILED: No devices allocated"
+      fi
+      echo ""
+
+      echo "=== NUMA Topology ==="
+      for device_dir in /sys/class/mock-accel/*; do
+        device=$(basename "$device_dir")
+        numa=$(cat "$device_dir/numa_node")
+        device_type=$([ -L "$device_dir/device/physfn" ] && echo "VF" || echo "PF")
+        echo "$device ($device_type): NUMA node $numa"
+      done
+      echo ""
+
+      echo "=== PCIe Topology ==="
+      for device_dir in /sys/class/mock-accel/*; do
+        device=$(basename "$device_dir")
+        pci=$(readlink "$device_dir/device" | xargs basename)
+        bus=$(echo "$pci" | cut -d: -f2)
+        device_type=$([ -L "$device_dir/device/physfn" ] && echo "VF" || echo "PF")
+        echo "$device ($device_type): $pci (bus 0x$bus)"
+      done
+      echo ""
+
+      echo "=== Sleeping for 1 hour (for interactive testing) ==="
+      sleep 3600
+    resources:
+      claims:
+      - name: devices
+  restartPolicy: Never

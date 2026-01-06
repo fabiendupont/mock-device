@@ -1,0 +1,13 @@
+{{- if .Values.namespace.create }}
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: {{ include "mock-device.namespace" . }}
+  labels:
+    {{- include "mock-device.labels" . | nindent 4 }}
+    # Required for KMM module loading
+    pod-security.kubernetes.io/enforce: privileged
+    pod-security.kubernetes.io/audit: privileged
+    pod-security.kubernetes.io/warn: privileged
+    kmm.node.k8s.io/contains-modules: ''
+{{- end }}

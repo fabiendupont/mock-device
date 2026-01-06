@@ -1,0 +1,108 @@
+# PCIe Bus Locality Example
+#
+# Use Case: Allocate multiple devices on the same PCIe bus for optimal I/O locality
+#
+# Expected Result:
+# - Pod receives 2 mock-accel devices from the same PCIe bus
+# - Both devices have PCI addresses starting with the same bus prefix
+# - Container can verify PCIe bus locality via PCI addresses
+#
+# Testing Instructions:
+# 1. Apply this file: kubectl apply -f pcie-locality.yaml
+# 2. Wait for pod to be Running: kubectl wait --for=condition=Ready pod/pcie-locality-test --timeout=60s
+# 3. Check allocated devices: kubectl exec pcie-locality-test -- env | grep MOCK_ACCEL
+# 4. Verify PCIe bus locality:
+#    kubectl exec pcie-locality-test -- sh -c 'readlink /sys/class/mock-accel/*/device | xargs -n1 basename | cut -d: -f1-2 | sort -u | wc -l'
+#    # Should output "1" (all devices on same PCIe bus)
+# 5. Display device PCI addresses:
+#    kubectl exec pcie-locality-test -- sh -c 'for d in /sys/class/mock-accel/*; do echo "$(basename $d): $(readlink $d/device | xargs basename)"; done'
+# 6. Cleanup: kubectl delete -f pcie-locality.yaml
+
+---
+apiVersion: resource.k8s.io/v1
+kind: ResourceClaim
+metadata:
+  name: pcie-locality-claim
+spec:
+  devices:
+    requests:
+    - name: device-0
+      deviceClassName: mock-accel-pf
+      count: 1
+      selectors:
+      # Select devices from PCIe bus 0x11 (0000:11:xx.x)
+      - cel:
+          expression: device.attributes["mock-accel.example.com/pciAddress"].stringValue.startsWith("0000:11:")
+    - name: device-1
+      deviceClassName: mock-accel-pf
+      count: 1
+      selectors:
+      # Select devices from PCIe bus 0x11 (0000:11:xx.x)
+      - cel:
+          expression: device.attributes["mock-accel.example.com/pciAddress"].stringValue.startsWith("0000:11:")
+
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: pcie-locality-test
+spec:
+  resourceClaims:
+  - name: devices
+    resourceClaimName: pcie-locality-claim
+  containers:
+  - name: app
+    image: busybox:latest
+    command:
+    - sh
+    - -c
+    - |
+      echo "=== PCIe Bus Locality Test ==="
+      echo ""
+      echo "=== Allocated Devices ==="
+      env | grep MOCK_ACCEL | sort
+      echo ""
+
+      echo "=== Device PCI Addresses ==="
+      for device_dir in /sys/class/mock-accel/*; do
+        device=$(basename "$device_dir")
+        pci_path=$(readlink "$device_dir/device")
+        pci=$(basename "$pci_path")
+        uuid=$(cat "$device_dir/uuid")
+        numa=$(cat "$device_dir/numa_node")
+
+        # Extract bus number from PCI address (0000:11:00.0 -> 0x11)
+        bus=$(echo "$pci" | cut -d: -f2)
+
+        echo "Device: $device"
+        echo "  UUID: $uuid"
+        echo "  PCI:  $pci"
+        echo "  Bus:  0x$bus"
+        echo "  NUMA: $numa"
+        echo ""
+      done
+
+      echo "=== PCIe Bus Locality Check ==="
+      unique_buses=$(readlink /sys/class/mock-accel/*/device | xargs -n1 basename | cut -d: -f2 | sort -u | wc -l)
+      if [ "$unique_buses" -eq 1 ]; then
+        bus=$(readlink /sys/class/mock-accel/*/device | head -1 | xargs basename | cut -d: -f2)
+        echo "✓ SUCCESS: All devices on same PCIe bus (0x$bus)"
+      else
+        echo "✗ FAILED: Devices span multiple PCIe buses ($unique_buses different buses)"
+      fi
+      echo ""
+
+      echo "=== Device Capabilities ==="
+      for device_dir in /sys/class/mock-accel/*; do
+        device=$(basename "$device_dir")
+        caps=$(cat "$device_dir/capabilities")
+        echo "$device: $caps"
+      done
+      echo ""
+
+      echo "=== Sleeping for 1 hour (for interactive testing) ==="
+      sleep 3600
+    resources:
+      claims:
+      - name: devices
+  restartPolicy: Never

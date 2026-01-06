@@ -1,0 +1,35 @@
+# Version header (generated)
+vfio-user/version.h
+
+# Kernel module backup files (generated during build)
+kernel-driver/mock-accel.c.bak
+
+# Build artifacts
+dra-driver/bin/
+vfio-user/mock-accel-server
+kernel-driver/*.ko
+kernel-driver/*.o
+kernel-driver/*.mod
+kernel-driver/*.mod.c
+kernel-driver/.*.cmd
+kernel-driver/modules.order
+kernel-driver/Module.symvers
+
+# VM images
+test/images/*.qcow2
+!test/images/README.md
+
+# Test artifacts
+*.sock
+*.log
+tmp/
+
+# Helm
+charts/**/*.tgz
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~

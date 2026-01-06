@@ -1,0 +1,19 @@
+apiVersion: kmm.sigs.x-k8s.io/v1beta1
+kind: Module
+metadata:
+  name: mock-accel
+  namespace: mock-device
+spec:
+  moduleLoader:
+    container:
+      modprobe:
+        moduleName: mock-accel
+      imagePullPolicy: IfNotPresent
+      kernelMappings:
+        # Match Fedora 43 kernels
+        - regexp: '^.*\.fc43\.x86_64$'
+          # Image will be built and imported into k3s
+          containerImage: "mock-accel-module:latest"
+  selector:
+    # Deploy on all nodes
+    kubernetes.io/os: linux
