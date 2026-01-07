@@ -109,7 +109,7 @@ jobs:
         if: matrix.arch == 'amd64'
         run: |
           sudo apt-get update
-          sudo apt-get install -y gcc make libjson-c-dev meson ninja-build
+          sudo apt-get install -y gcc make libjson-c-dev libcmocka-dev meson ninja-build
 
       - name: Build libvfio-user (amd64 only)
         if: matrix.arch == 'amd64'
