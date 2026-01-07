@@ -109,15 +109,14 @@ jobs:
         if: matrix.arch == 'amd64'
         run: |
           sudo apt-get update
-          sudo apt-get install -y cmake gcc make libjson-c-dev
+          sudo apt-get install -y gcc make libjson-c-dev meson ninja-build
 
       - name: Build libvfio-user (amd64 only)
         if: matrix.arch == 'amd64'
         working-directory: libvfio-user
         run: |
-          mkdir -p build && cd build
-          cmake -DCMAKE_BUILD_TYPE=Release ..
-          make
+          meson setup build --buildtype=release
+          meson compile -C build
 
       - name: Build mock-accel-server (amd64 only)
         if: matrix.arch == 'amd64'
