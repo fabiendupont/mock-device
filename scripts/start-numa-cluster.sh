@@ -143,12 +143,34 @@ echo "  VF0: PID $!"
 echo "  VF1: PID $!"
 
 cd - >/dev/null
-sleep 2
+
+# Wait for all socket files to be created
+echo -e "${YELLOW}Waiting for socket files to be created...${NC}"
+EXPECTED_SOCKETS=12
+MAX_WAIT=30
+ELAPSED=0
+
+while [ $ELAPSED -lt $MAX_WAIT ]; do
+    SOCKET_COUNT=$(ls /tmp/numa-cluster-*.sock 2>/dev/null | wc -l)
+    if [ "$SOCKET_COUNT" -eq "$EXPECTED_SOCKETS" ]; then
+        echo -e "${GREEN}✓ All $EXPECTED_SOCKETS sockets created${NC}"
+        break
+    fi
+    echo -e "  Waiting... ($SOCKET_COUNT/$EXPECTED_SOCKETS sockets ready)"
+    sleep 1
+    ELAPSED=$((ELAPSED + 1))
+done
+
+if [ "$SOCKET_COUNT" -ne "$EXPECTED_SOCKETS" ]; then
+    echo -e "${RED}✗ Timeout waiting for sockets (found $SOCKET_COUNT/$EXPECTED_SOCKETS)${NC}"
+    exit 1
+fi
+echo
 
 # Set socket permissions for libvirt/QEMU access
 echo -e "${YELLOW}Setting socket permissions...${NC}"
 for sock in /tmp/numa-cluster-*.sock; do
-    [ -e "$sock" ] && chmod 666 "$sock"
+    chmod 666 "$sock"
 done
 echo -e "${GREEN}✓ Socket permissions set${NC}"
 echo

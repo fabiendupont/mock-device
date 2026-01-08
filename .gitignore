@@ -23,6 +23,7 @@ test/images/*.qcow2
 *.sock
 *.log
 tmp/
+test-release/
 
 # Helm
 charts/**/*.tgz
