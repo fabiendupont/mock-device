@@ -104,16 +104,69 @@ kernelModule:
   # Module name
   moduleName: mock-accel
 
-  # Container image settings
-  image:
-    repository: ghcr.io/fabiendupont/mock-accel-module
-    tag: v0.1.0
-    pullPolicy: IfNotPresent
+  # Firmware configuration
+  firmware:
+    # Enable firmware deployment
+    enabled: true
+    # ConfigMap name for firmware files
+    configMapName: mock-accel-firmware
 
-  # Kernel mappings for different distributions
-  kernelMappings:
-    - regexp: '^.*\.fc43\.x86_64$'
-      containerImage: "ghcr.io/fabiendupont/mock-accel-module:v1.0.0-fc43"
+  # Build mode: "prebuilt" or "build"
+  # - prebuilt: Use pre-compiled container images (fast, requires image maintenance)
+  # - build: Compile in-cluster for any kernel version (slower, no image maintenance)
+  mode: prebuilt
+
+  # Pre-built mode configuration
+  prebuilt:
+    # Container image settings
+    image:
+      repository: ghcr.io/fabiendupont/mock-accel-module
+      # Tag defaults to Chart.appVersion if empty
+      tag: ""
+      pullPolicy: IfNotPresent
+
+    # Kernel mappings for different distributions
+    # containerImage can be omitted to auto-generate from repository:tag
+    kernelMappings:
+      - regexp: '^.*\.fc43\.x86_64$'
+        containerImage: "ghcr.io/fabiendupont/mock-accel-module:v1.0.0-fc43"
+
+  # In-cluster build configuration
+  build:
+    # Dockerfile ConfigMap for build
+    dockerfile:
+      # Use ConfigMap (default)
+      configMapEnabled: true
+      configMapName: mock-accel-dockerfile
+      # Or use inline Dockerfile (leave empty to use ConfigMap)
+      inline: ""
+
+    # Build arguments
+    buildArgs:
+      # Kernel version is auto-detected if empty
+      - name: KERNEL_VERSION
+        value: ""
+
+    # Registry configuration (optional - for pushing built images)
+    registry:
+      # Enable registry push
+      enabled: false
+      # Registry URL
+      url: ghcr.io
+      # Image name (without registry URL)
+      imageName: fabiendupont/mock-accel-module
+      # Tag (auto-generated from kernel version if empty)
+      tag: ""
+      # Secret name for registry authentication
+      secretName: registry-credentials
+
+    # Kernel mappings for built images
+    # Build will be triggered for matching kernel versions
+    kernelMappings:
+      - regexp: '^.*$'  # Match all kernels by default
+        # Image will be built dynamically
+        # If registry.enabled=true, image is pushed to registry
+        # If registry.enabled=false, image is cached locally
 
   # Node selector for module deployment
   nodeSelector:

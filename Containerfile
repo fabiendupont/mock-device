@@ -49,8 +49,8 @@ COPY --from=builder /build/mock-accel.ko /tmp/mock-accel.ko
 RUN . /tmp/kernel_version.sh && \
     mv /tmp/mock-accel.ko /opt/lib/modules/${KERNEL_VERSION}/extra/
 
-# Copy firmware
-COPY vfio-user/mock-accel-wordlist.fw /lib/firmware/
+# Copy firmware into the container image
+COPY charts/mock-device/firmware/mock-accel-wordlist.txt /lib/firmware/
 
 # Run depmod to update module dependencies
 RUN . /tmp/kernel_version.sh && depmod -a -b /opt ${KERNEL_VERSION}

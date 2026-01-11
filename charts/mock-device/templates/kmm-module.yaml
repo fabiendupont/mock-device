@@ -11,9 +11,50 @@ spec:
     container:
       modprobe:
         moduleName: {{ .Values.kernelModule.moduleName }}
-      imagePullPolicy: {{ .Values.kernelModule.image.pullPolicy }}
+      {{- if eq .Values.kernelModule.mode "prebuilt" }}
+      {{- /* Pre-built mode: Use existing container images */}}
+      imagePullPolicy: {{ .Values.kernelModule.prebuilt.image.pullPolicy | default "IfNotPresent" }}
       kernelMappings:
-        {{- toYaml .Values.kernelModule.kernelMappings | nindent 8 }}
+        {{- range .Values.kernelModule.prebuilt.kernelMappings }}
+        - regexp: {{ .regexp | quote }}
+          containerImage: {{ .containerImage | default (printf "%s:%s" $.Values.kernelModule.prebuilt.image.repository ($.Values.kernelModule.prebuilt.image.tag | default $.Chart.AppVersion)) | quote }}
+        {{- end }}
+      {{- else if eq .Values.kernelModule.mode "build" }}
+      {{- /* In-cluster build mode: Compile module for detected kernel */}}
+      imagePullPolicy: IfNotPresent
+      kernelMappings:
+        {{- range .Values.kernelModule.build.kernelMappings }}
+        - regexp: {{ .regexp | quote }}
+          {{- if $.Values.kernelModule.build.registry.enabled }}
+          {{- /* Push built image to registry */}}
+          containerImage: {{ printf "%s/%s:%s" $.Values.kernelModule.build.registry.url $.Values.kernelModule.build.registry.imageName ($.Values.kernelModule.build.registry.tag | default "latest") | quote }}
+          {{- else }}
+          {{- /* Build and cache locally */}}
+          containerImage: "mock-accel-module:kmm-build"
+          {{- end }}
+          build:
+            {{- if $.Values.kernelModule.build.dockerfile.configMapEnabled }}
+            dockerfileConfigMap:
+              name: {{ $.Values.kernelModule.build.dockerfile.configMapName | default "mock-accel-dockerfile" }}
+            {{- else if $.Values.kernelModule.build.dockerfile.inline }}
+            dockerfile: {{ $.Values.kernelModule.build.dockerfile.inline | quote }}
+            {{- end }}
+            {{- if $.Values.kernelModule.build.buildArgs }}
+            buildArgs:
+            {{- range $.Values.kernelModule.build.buildArgs }}
+            - name: {{ .name }}
+              value: {{ .value | quote }}
+            {{- end }}
+            {{- end }}
+            {{- if $.Values.kernelModule.build.registry.enabled }}
+            {{- /* Registry authentication for pushing images */}}
+            secrets:
+            - name: {{ $.Values.kernelModule.build.registry.secretName }}
+            {{- end }}
+        {{- end }}
+      {{- else }}
+      {{- fail (printf "Invalid kernelModule.mode: %s. Must be 'prebuilt' or 'build'" .Values.kernelModule.mode) }}
+      {{- end }}
   selector:
     {{- toYaml .Values.kernelModule.nodeSelector | nindent 4 }}
 {{- end }}

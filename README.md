@@ -45,6 +45,8 @@ This project enables end-to-end testing of the [k8s-dra-driver-nodepartition](ht
 
 - **vfio-user based**: Userspace device emulation using libvfio-user
 - **Kernel driver**: Exposes device attributes via `/sys/class/mock-accel/` for manipulation
+- **Character device interface**: `/dev/mockN` nodes with file operations and ioctl for device interaction
+- **Firmware support**: EFF wordlist firmware for cryptographic passphrase generation
 - **SR-IOV support**: Physical Functions (PF) with Virtual Functions (VF) for realistic device partitioning
 - **Configurable topology**: Multiple NUMA nodes with devices assigned via pxb-pcie
 - **Realistic PCIe**: Devices appear in `/sys/bus/pci/devices/` with proper `numa_node`
@@ -55,26 +57,80 @@ This project enables end-to-end testing of the [k8s-dra-driver-nodepartition](ht
 
 ### Kubernetes Installation (Helm)
 
-Install mock-device on an existing Kubernetes cluster using Helm:
+Install mock-device on an existing Kubernetes cluster using Helm. The chart supports two deployment modes for kernel module management:
+
+#### Mode 1: DRA Driver Only (Manual Module Management)
+
+Use this when the kernel module is already loaded on nodes (manual install, other automation):
 
 ```bash
-# Install DRA driver only (assumes kernel module already loaded)
 helm install mock-device oci://ghcr.io/fabiendupont/charts/mock-device \
-  --version 0.1.0 \
+  --version 0.2.0 \
   --namespace mock-device --create-namespace
+```
 
-# Install DRA driver + kernel module (via KMM)
+#### Mode 2: Pre-built Kernel Module (Recommended)
+
+Use this when you have pre-built kernel module images for your kernel versions:
+
+```bash
 helm install mock-device oci://ghcr.io/fabiendupont/charts/mock-device \
-  --version 0.1.0 \
+  --version 0.2.0 \
   --namespace mock-device --create-namespace \
   --set kernelModule.enabled=true \
-  --set kernelModule.image.tag=v0.1.0-fc43
+  --set kernelModule.mode=prebuilt \
+  --set kernelModule.prebuilt.image.repository=ghcr.io/fabiendupont/mock-accel-module \
+  --set kernelModule.prebuilt.image.tag=v0.2.0-fc43
 ```
+
+**Kernel version mapping:**
+```bash
+# values.yaml example
+kernelModule:
+  enabled: true
+  mode: prebuilt
+  prebuilt:
+    kernelMappings:
+      - regexp: '^.*\.fc43\.x86_64$'
+        containerImage: ghcr.io/fabiendupont/mock-accel-module:v0.2.0-fc43
+      - regexp: '^.*\.fc42\.x86_64$'
+        containerImage: ghcr.io/fabiendupont/mock-accel-module:v0.2.0-fc42
+```
+
+#### Mode 3: In-Cluster Build (Development)
+
+Use this to build kernel modules on-demand for any kernel version:
+
+```bash
+helm install mock-device oci://ghcr.io/fabiendupont/charts/mock-device \
+  --version 0.2.0 \
+  --namespace mock-device --create-namespace \
+  --set kernelModule.enabled=true \
+  --set kernelModule.mode=build \
+  --set kernelModule.build.dockerfile.configMapEnabled=true
+```
+
+**Build mode features:**
+- Automatically detects node kernel versions
+- Compiles module using kernel headers from package repos
+- Requires matching kernel-devel packages in distribution repos
+- Best for development and testing environments
+
+**Build mode limitations:**
+- Requires exact kernel-devel version match in package repos
+- May fail for manually-installed or custom kernels
+- Build time adds to initial deployment duration
 
 **Verify installation:**
 ```bash
 # Check pods are running
 kubectl get pods -n mock-device
+
+# For build mode, check build pods completed successfully
+kubectl get pods -n mock-device -l kmm.node.kubernetes.io/build-pod=true
+
+# Check kernel module is loaded on nodes
+kubectl get module -n mock-device mock-accel
 
 # Check ResourceSlices are published
 kubectl get resourceslices -l driver=mock-accel.example.com
@@ -186,6 +242,92 @@ for d in /sys/class/mock-accel/mock*; do
 done
 # mock0: NUMA 0, UUID ...
 # mock1: NUMA 1, UUID ...
+
+# Test character device interface
+cat /dev/mock0
+# Mock Accelerator Device
+# UUID: ...
+# Memory: 17179869184 bytes
+# Status: 0x00000001
+# NUMA Node: 0
+# Wordlist: 7776 words loaded
+# Sample Passphrase (6 words): countdown-gigabyte-headway-armchair-untouched-raft
+```
+
+### Character Device Interface
+
+The kernel driver creates `/dev/mockN` character devices for each detected PCIe device, providing standard Linux device node access:
+
+**File Operations:**
+```bash
+# Read device information
+cat /dev/mock0
+
+# Standard permissions apply
+sudo chmod 666 /dev/mock0
+ls -l /dev/mock0
+# crw-rw-rw-. 1 root root 239, 0 Jan 10 20:27 /dev/mock0
+```
+
+**ioctl Operations:**
+
+The driver provides an ioctl interface for passphrase generation using the EFF long wordlist (7,776 words):
+
+```c
+// test-passphrase.c
+#include <fcntl.h>
+#include <sys/ioctl.h>
+#include <stdint.h>
+
+#define MOCK_ACCEL_IOC_MAGIC 'M'
+
+struct mock_accel_passphrase {
+    uint8_t word_count;      // Input: 1-12 words (0 = default 6)
+    char passphrase[256];    // Output: hyphen-separated passphrase
+};
+
+#define MOCK_ACCEL_IOC_STATUS _IOR(MOCK_ACCEL_IOC_MAGIC, 1, uint32_t)
+#define MOCK_ACCEL_IOC_PASSPHRASE _IOWR(MOCK_ACCEL_IOC_MAGIC, 2, struct mock_accel_passphrase)
+
+int fd = open("/dev/mock0", O_RDONLY);
+struct mock_accel_passphrase pass = {.word_count = 6};
+ioctl(fd, MOCK_ACCEL_IOC_PASSPHRASE, &pass);
+printf("Passphrase: %s\n", pass.passphrase);
+// Output: "countdown-gigabyte-headway-armchair-untouched-raft"
+```
+
+**Build and run test program:**
+```bash
+gcc -o test-passphrase test-passphrase.c
+sudo ./test-passphrase /dev/mock0
+# Generated passphrase (6 words): countdown-gigabyte-headway-armchair-untouched-raft
+
+# Generate passphrases with different word counts
+sudo ./test-passphrase /dev/mock0 4
+# Generated passphrase (4 words): crazily-halogen-spearfish-mollusk
+
+sudo ./test-passphrase /dev/mock0 12
+# Generated passphrase (12 words): stiffly-stove-startup-stopwatch-clover-kiwi-subduing-unfasten-preteen-quiver-grouped-tattoo
+```
+
+**Security Features:**
+- Uses cryptographic RNG (`get_random_bytes()`) for secure random selection
+- EFF long wordlist provides 77.5 bits of entropy for 6-word passphrases
+- Wordlist loaded from firmware at module initialization
+
+**Firmware Management:**
+
+The driver loads the EFF long wordlist (7,776 words) as firmware during initialization:
+
+```bash
+# Check firmware status in dmesg
+sudo dmesg | grep -i firmware
+# mock-accel 0000:11:00.0: Loaded 7776 words from firmware
+
+# When using KMM, firmware is embedded in the container image
+# For manual loading, firmware must be in /lib/firmware/
+sudo cp firmware/mock-accel-wordlist.txt /lib/firmware/
+sudo insmod mock-accel.ko
 ```
 
 ## Architecture
@@ -226,9 +368,42 @@ Host                                    QEMU Guest (q35 Machine)
 | 0x28 | 4B | CAPABILITIES | Feature flags (read-only) |
 | 0x2C | 4B | STATUS | Device status (read/write) |
 
-### PCI sysfs Interface
+### Kernel Driver Interfaces
 
-The devices appear as standard PCI devices and can be discovered via `/sys/bus/pci/devices/`:
+The mock-accel kernel driver provides two interfaces for device interaction:
+
+**1. sysfs Class Interface** (`/sys/class/mock-accel/`)
+
+DRA drivers use this interface to discover devices and manage allocation state:
+
+```
+/sys/class/mock-accel/mock0/
+├── uuid              # Device UUID (read from BAR0)
+├── memory_size       # Device memory in bytes
+├── numa_node         # NUMA node (inherited from PCI device)
+├── capabilities      # Feature flags
+├── status            # Allocation state (read/write)
+└── device -> ../../../0000:11:00.0
+```
+
+**2. Character Device Interface** (`/dev/mockN`)
+
+Applications use character devices for direct device access:
+
+```
+/dev/mock0           # Character device node (major 239, minor 0)
+/dev/mock1           # Character device node (major 239, minor 1)
+...
+```
+
+Operations supported:
+- `read()` - Returns device information and sample passphrase
+- `ioctl(MOCK_ACCEL_IOC_STATUS)` - Read device status register
+- `ioctl(MOCK_ACCEL_IOC_PASSPHRASE)` - Generate cryptographic passphrase (1-12 words)
+
+**3. PCI sysfs Interface**
+
+The devices also appear as standard PCI devices via `/sys/bus/pci/devices/`:
 
 ```
 /sys/bus/pci/devices/0000:11:00.0/
@@ -238,13 +413,8 @@ The devices appear as standard PCI devices and can be discovered via `/sys/bus/p
 ├── numa_node      # "0" (inherited from pxb-pcie)
 ├── resource       # BAR mappings
 ├── config         # PCI configuration space
-└── ...
-
-/sys/bus/pci/devices/0000:21:00.0/
-├── vendor         # "0x1de5"
-├── device         # "0x0001"
-├── numa_node      # "1" (inherited from pxb-pcie)
-└── ...
+└── mock-accel/
+    └── mock0 -> ../../../../class/mock-accel/mock0
 ```
 
 DRA drivers can scan for devices by vendor/device ID and read topology from `numa_node`.

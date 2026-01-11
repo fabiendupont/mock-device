@@ -13,9 +13,15 @@
 #include <linux/uuid.h>
 #include <linux/version.h>
 #include <linux/firmware.h>
+#include <linux/cdev.h>
+#include <linux/fs.h>
+#include <linux/uaccess.h>
+#include <linux/ioctl.h>
+#include <linux/random.h>
+#include <linux/string.h>
 
 #define DRV_NAME "mock-accel"
-#define DRV_VERSION "1.0"
+#define DRV_VERSION "0.1.0"
 
 /* PCI IDs */
 #define MOCK_VENDOR_ID 0x1de5  /* Eideticom, Inc */
@@ -41,12 +47,31 @@
 /* BAR sizes */
 #define BAR0_SIZE           4096
 
+/* Character device definitions */
+#define MOCK_ACCEL_MAX_DEVICES 256
+#define MOCK_ACCEL_WORDLIST_SIZE 7776
+#define MOCK_ACCEL_MAX_WORDS 12
+#define MOCK_ACCEL_DEFAULT_WORDS 6
+
+/* ioctl commands */
+#define MOCK_ACCEL_IOC_MAGIC 'M'
+#define MOCK_ACCEL_IOC_STATUS _IOR(MOCK_ACCEL_IOC_MAGIC, 1, u32)
+
+struct mock_accel_passphrase {
+	u8 word_count;           /* Input: 1-12 words (0 = default 6) */
+	char passphrase[256];    /* Output: hyphen-separated passphrase */
+};
+#define MOCK_ACCEL_IOC_PASSPHRASE _IOWR(MOCK_ACCEL_IOC_MAGIC, 2, struct mock_accel_passphrase)
+
 /* Device state */
 struct mock_accel_dev {
 	struct pci_dev *pdev;
 	void __iomem *bar0;
 	struct device *class_dev;
 	int minor;
+
+	/* Character device */
+	struct cdev cdev;
 
 	/* Cached device attributes */
 	uuid_t uuid;
@@ -58,6 +83,8 @@ struct mock_accel_dev {
 	/* Firmware management */
 	const struct firmware *wordlist_fw;
 	bool wordlist_loaded;
+	char **wordlist;         /* Parsed word array */
+	size_t wordlist_count;   /* Number of words loaded */
 
 	/* SR-IOV support */
 	bool is_vf;
@@ -68,6 +95,7 @@ struct mock_accel_dev {
 
 static struct class *mock_accel_class;
 static DEFINE_IDA(mock_accel_ida);
+static dev_t mock_accel_devt;  /* First device number */
 
 /*
  * Read UUID from BAR0
@@ -99,6 +127,272 @@ static void read_device_attrs(struct mock_accel_dev *mdev)
 	mdev->status = ioread32(mdev->bar0 + REG_STATUS);
 	mdev->fw_version = ioread32(mdev->bar0 + REG_FW_VERSION);
 }
+
+/*
+ * Load and parse wordlist firmware
+ */
+static int mock_accel_load_wordlist(struct mock_accel_dev *mdev)
+{
+	const struct firmware *fw;
+	char *data, *line, *next;
+	size_t i = 0;
+	int ret;
+
+	ret = request_firmware(&fw, "mock-accel-wordlist.txt", &mdev->pdev->dev);
+	if (ret) {
+		dev_err(&mdev->pdev->dev, "Failed to load wordlist firmware: %d\n", ret);
+		return ret;
+	}
+
+	mdev->wordlist_fw = fw;
+
+	/* Allocate word array */
+	mdev->wordlist = kmalloc_array(MOCK_ACCEL_WORDLIST_SIZE, sizeof(char *), GFP_KERNEL);
+	if (!mdev->wordlist) {
+		release_firmware(fw);
+		mdev->wordlist_fw = NULL;
+		return -ENOMEM;
+	}
+
+	/* Parse firmware data (one word per line) */
+	data = kmalloc(fw->size + 1, GFP_KERNEL);
+	if (!data) {
+		kfree(mdev->wordlist);
+		mdev->wordlist = NULL;
+		release_firmware(fw);
+		mdev->wordlist_fw = NULL;
+		return -ENOMEM;
+	}
+
+	memcpy(data, fw->data, fw->size);
+	data[fw->size] = '\0';
+
+	line = data;
+	while (line && *line && i < MOCK_ACCEL_WORDLIST_SIZE) {
+		/* Find end of line */
+		next = strchr(line, '\n');
+		if (next)
+			*next++ = '\0';
+
+		/* Skip empty lines and whitespace */
+		while (*line == ' ' || *line == '\t' || *line == '\r')
+			line++;
+
+		if (*line) {
+			/* Remove trailing whitespace */
+			char *end = line + strlen(line) - 1;
+			while (end > line && (*end == ' ' || *end == '\t' || *end == '\r'))
+				*end-- = '\0';
+
+			mdev->wordlist[i] = kstrdup(line, GFP_KERNEL);
+			if (!mdev->wordlist[i]) {
+				/* Cleanup on error */
+				while (i > 0)
+					kfree(mdev->wordlist[--i]);
+				kfree(mdev->wordlist);
+				mdev->wordlist = NULL;
+				kfree(data);
+				release_firmware(fw);
+				mdev->wordlist_fw = NULL;
+				return -ENOMEM;
+			}
+			i++;
+		}
+
+		line = next;
+	}
+
+	mdev->wordlist_count = i;
+	kfree(data);
+
+	dev_info(&mdev->pdev->dev, "Loaded %zu words from firmware\n", mdev->wordlist_count);
+	return 0;
+}
+
+/*
+ * Free wordlist resources
+ */
+static void mock_accel_free_wordlist(struct mock_accel_dev *mdev)
+{
+	size_t i;
+
+	if (mdev->wordlist) {
+		for (i = 0; i < mdev->wordlist_count; i++)
+			kfree(mdev->wordlist[i]);
+		kfree(mdev->wordlist);
+		mdev->wordlist = NULL;
+	}
+
+	if (mdev->wordlist_fw) {
+		release_firmware(mdev->wordlist_fw);
+		mdev->wordlist_fw = NULL;
+	}
+
+	mdev->wordlist_count = 0;
+	mdev->wordlist_loaded = false;
+}
+
+/*
+ * Generate passphrase using wordlist
+ */
+static int mock_accel_generate_passphrase(struct mock_accel_dev *mdev,
+					   u8 word_count, char *output, size_t output_size)
+{
+	u16 indices[MOCK_ACCEL_MAX_WORDS];
+	size_t i, offset = 0;
+
+	if (!mdev->wordlist || mdev->wordlist_count == 0)
+		return -ENOENT;
+
+	if (word_count == 0)
+		word_count = MOCK_ACCEL_DEFAULT_WORDS;
+
+	if (word_count > MOCK_ACCEL_MAX_WORDS)
+		return -EINVAL;
+
+	/* Generate random indices using cryptographic RNG */
+	get_random_bytes(indices, word_count * sizeof(u16));
+
+	/* Build passphrase string */
+	for (i = 0; i < word_count; i++) {
+		const char *word;
+		size_t word_len;
+
+		/* Map random u16 to wordlist index */
+		indices[i] = indices[i] % mdev->wordlist_count;
+		word = mdev->wordlist[indices[i]];
+		word_len = strlen(word);
+
+		/* Check buffer space */
+		if (offset + word_len + 2 > output_size)  /* +2 for hyphen and null */
+			return -ENOSPC;
+
+		/* Append word */
+		memcpy(output + offset, word, word_len);
+		offset += word_len;
+
+		/* Add hyphen separator (except after last word) */
+		if (i < word_count - 1) {
+			output[offset++] = '-';
+		}
+	}
+
+	output[offset] = '\0';
+	return 0;
+}
+
+/*
+ * Character device file operations
+ */
+static int mock_accel_open(struct inode *inode, struct file *filp)
+{
+	struct mock_accel_dev *mdev;
+
+	mdev = container_of(inode->i_cdev, struct mock_accel_dev, cdev);
+	filp->private_data = mdev;
+
+	dev_dbg(&mdev->pdev->dev, "Device opened\n");
+	return 0;
+}
+
+static int mock_accel_release(struct inode *inode, struct file *filp)
+{
+	struct mock_accel_dev *mdev = filp->private_data;
+	dev_dbg(&mdev->pdev->dev, "Device released\n");
+	return 0;
+}
+
+static ssize_t mock_accel_read(struct file *filp, char __user *buf,
+			       size_t count, loff_t *f_pos)
+{
+	struct mock_accel_dev *mdev = filp->private_data;
+	char info[512];
+	char sample_passphrase[256];
+	int len, ret;
+
+	if (*f_pos > 0)
+		return 0;  /* EOF */
+
+	/* Generate sample passphrase for demonstration */
+	ret = mock_accel_generate_passphrase(mdev, MOCK_ACCEL_DEFAULT_WORDS,
+					     sample_passphrase, sizeof(sample_passphrase));
+	if (ret)
+		snprintf(sample_passphrase, sizeof(sample_passphrase), "(firmware not loaded)");
+
+	len = snprintf(info, sizeof(info),
+		       "Mock Accelerator Device\n"
+		       "UUID: %pUb\n"
+		       "Memory: %llu bytes\n"
+		       "Status: 0x%08x\n"
+		       "NUMA Node: %d\n"
+		       "Wordlist: %zu words loaded\n"
+		       "Sample Passphrase (6 words): %s\n",
+		       &mdev->uuid,
+		       mdev->memory_size,
+		       ioread32(mdev->bar0 + REG_STATUS),
+		       dev_to_node(&mdev->pdev->dev),
+		       mdev->wordlist_count,
+		       sample_passphrase);
+
+	if (count < len)
+		len = count;
+
+	if (copy_to_user(buf, info, len))
+		return -EFAULT;
+
+	*f_pos += len;
+	return len;
+}
+
+static long mock_accel_ioctl(struct file *filp, unsigned int cmd,
+			     unsigned long arg)
+{
+	struct mock_accel_dev *mdev = filp->private_data;
+	struct mock_accel_passphrase pass;
+	u32 status;
+	int ret;
+
+	switch (cmd) {
+	case MOCK_ACCEL_IOC_STATUS:
+		status = ioread32(mdev->bar0 + REG_STATUS);
+		if (copy_to_user((u32 __user *)arg, &status, sizeof(status)))
+			return -EFAULT;
+		return 0;
+
+	case MOCK_ACCEL_IOC_PASSPHRASE:
+		if (copy_from_user(&pass, (void __user *)arg, sizeof(pass)))
+			return -EFAULT;
+
+		/* Validate word count */
+		if (pass.word_count > MOCK_ACCEL_MAX_WORDS)
+			return -EINVAL;
+
+		/* Generate passphrase */
+		ret = mock_accel_generate_passphrase(mdev, pass.word_count,
+						     pass.passphrase, sizeof(pass.passphrase));
+		if (ret)
+			return ret;
+
+		if (copy_to_user((void __user *)arg, &pass, sizeof(pass)))
+			return -EFAULT;
+
+		dev_dbg(&mdev->pdev->dev, "Generated %u-word passphrase\n",
+			pass.word_count ? pass.word_count : MOCK_ACCEL_DEFAULT_WORDS);
+		return 0;
+
+	default:
+		return -ENOTTY;
+	}
+}
+
+static const struct file_operations mock_accel_fops = {
+	.owner = THIS_MODULE,
+	.open = mock_accel_open,
+	.release = mock_accel_release,
+	.read = mock_accel_read,
+	.unlocked_ioctl = mock_accel_ioctl,
+	.llseek = noop_llseek,
+};
 
 /*
  * sysfs attribute: uuid
@@ -431,24 +725,19 @@ static ssize_t load_wordlist_store(struct device *dev,
 	struct mock_accel_dev *mdev = dev_get_drvdata(dev);
 	int ret;
 
-	/* Release old firmware if loaded */
-	if (mdev->wordlist_fw) {
-		release_firmware(mdev->wordlist_fw);
-		mdev->wordlist_fw = NULL;
-		mdev->wordlist_loaded = false;
-	}
+	/* Free existing wordlist if loaded */
+	mock_accel_free_wordlist(mdev);
 
-	/* Request firmware */
-	ret = request_firmware(&mdev->wordlist_fw, "mock-accel-wordlist.fw",
-			       &mdev->pdev->dev);
+	/* Load new wordlist */
+	ret = mock_accel_load_wordlist(mdev);
 	if (ret) {
-		dev_err(dev, "Failed to load firmware: %d\n", ret);
+		dev_err(dev, "Failed to load wordlist firmware: %d\n", ret);
 		return ret;
 	}
 
 	mdev->wordlist_loaded = true;
-	dev_info(dev, "Loaded wordlist firmware (%zu bytes)\n",
-		 mdev->wordlist_fw->size);
+	dev_info(dev, "Reloaded wordlist firmware (%zu words)\n",
+		 mdev->wordlist_count);
 
 	return count;
 }
@@ -572,21 +861,38 @@ static int mock_accel_probe(struct pci_dev *pdev,
 	dev_info(&pdev->dev, "NUMA node: %d\n", dev_to_node(&pdev->dev));
 
 	/* Allocate minor number */
-	minor = ida_simple_get(&mock_accel_ida, 0, 0, GFP_KERNEL);
+	minor = ida_alloc_max(&mock_accel_ida, MOCK_ACCEL_MAX_DEVICES - 1, GFP_KERNEL);
 	if (minor < 0) {
 		ret = minor;
 		goto err_unmap;
 	}
 	mdev->minor = minor;
 
-	/* Create device in /sys/class/mock-accel/ */
+	/* Load wordlist firmware */
+	ret = mock_accel_load_wordlist(mdev);
+	if (ret) {
+		dev_warn(&pdev->dev, "Failed to load wordlist firmware: %d (passphrase generation disabled)\n", ret);
+		/* Non-fatal - device still functional without passphrase feature */
+	}
+
+	/* Initialize character device */
+	cdev_init(&mdev->cdev, &mock_accel_fops);
+	mdev->cdev.owner = THIS_MODULE;
+
+	ret = cdev_add(&mdev->cdev, MKDEV(MAJOR(mock_accel_devt), minor), 1);
+	if (ret) {
+		dev_err(&pdev->dev, "Failed to add cdev\n");
+		goto err_cdev;
+	}
+
+	/* Create device in /sys/class/mock-accel/ with /dev node */
 	if (mdev->is_vf && mdev->physfn) {
 		/* VF naming: mock<PF_minor>_vf<VF_index> */
 		struct mock_accel_dev *pf_mdev = pci_get_drvdata(mdev->physfn);
 		int vf_index = PCI_FUNC(pdev->devfn) - 1;  /* VFs start at function 1 */
 
 		mdev->class_dev = device_create_with_groups(mock_accel_class, &pdev->dev,
-							    MKDEV(0, 0), mdev,
+							    MKDEV(MAJOR(mock_accel_devt), minor), mdev,
 							    mock_accel_groups,
 							    "mock%d_vf%d",
 							    pf_mdev ? pf_mdev->minor : 0,
@@ -594,32 +900,26 @@ static int mock_accel_probe(struct pci_dev *pdev,
 	} else {
 		/* PF naming: mock<minor> */
 		mdev->class_dev = device_create_with_groups(mock_accel_class, &pdev->dev,
-							    MKDEV(0, 0), mdev,
+							    MKDEV(MAJOR(mock_accel_devt), minor), mdev,
 							    mock_accel_groups,
 							    "mock%d", minor);
 	}
 	if (IS_ERR(mdev->class_dev)) {
 		ret = PTR_ERR(mdev->class_dev);
 		dev_err(&pdev->dev, "Failed to create class device\n");
-		goto err_ida;
+		goto err_device;
 	}
 
-	/* Load wordlist firmware automatically */
-	ret = request_firmware(&mdev->wordlist_fw, "mock-accel-wordlist.fw",
-			       &pdev->dev);
-	if (ret) {
-		dev_warn(&pdev->dev, "Wordlist firmware not found (optional): %d\n", ret);
-		mdev->wordlist_loaded = false;
-	} else {
-		mdev->wordlist_loaded = true;
-		dev_info(&pdev->dev, "Loaded wordlist firmware (%zu bytes)\n",
-			 mdev->wordlist_fw->size);
-	}
+	dev_info(&pdev->dev, "Registered mock%d (UUID: %pUb, /dev/mock%d)\n",
+		 minor, &mdev->uuid, minor);
 
 	return 0;
 
-err_ida:
-	ida_simple_remove(&mock_accel_ida, minor);
+err_device:
+	cdev_del(&mdev->cdev);
+err_cdev:
+	mock_accel_free_wordlist(mdev);
+	ida_free(&mock_accel_ida, minor);
 err_unmap:
 	pci_iounmap(pdev, mdev->bar0);
 err_release:
@@ -636,13 +936,7 @@ static void mock_accel_remove(struct pci_dev *pdev)
 {
 	struct mock_accel_dev *mdev = pci_get_drvdata(pdev);
 
-	dev_info(&pdev->dev, "Removing mock accelerator device\n");
-
-	/* Release firmware if loaded */
-	if (mdev->wordlist_fw) {
-		release_firmware(mdev->wordlist_fw);
-		mdev->wordlist_fw = NULL;
-	}
+	dev_info(&pdev->dev, "Removing mock%d\n", mdev->minor);
 
 	/* Disable SR-IOV if this is a PF with VFs enabled */
 	if (!mdev->is_vf && mdev->sriov_num_vfs > 0) {
@@ -650,8 +944,16 @@ static void mock_accel_remove(struct pci_dev *pdev)
 		dev_info(&pdev->dev, "Disabled SR-IOV (%d VFs)\n", mdev->sriov_num_vfs);
 	}
 
-	device_destroy(mock_accel_class, MKDEV(0, mdev->minor));
-	ida_simple_remove(&mock_accel_ida, mdev->minor);
+	/* Destroy character device and class device */
+	device_destroy(mock_accel_class, MKDEV(MAJOR(mock_accel_devt), mdev->minor));
+	cdev_del(&mdev->cdev);
+
+	/* Free firmware resources */
+	mock_accel_free_wordlist(mdev);
+
+	/* Release minor number */
+	ida_free(&mock_accel_ida, mdev->minor);
+
 	pci_iounmap(pdev, mdev->bar0);
 	pci_release_region(pdev, 0);
 	pci_disable_device(pdev);
@@ -677,6 +979,15 @@ static int __init mock_accel_init(void)
 
 	pr_info("Mock Accelerator Driver v%s\n", DRV_VERSION);
 
+	/* Allocate character device region */
+	ret = alloc_chrdev_region(&mock_accel_devt, 0,
+				  MOCK_ACCEL_MAX_DEVICES,
+				  "mock-accel");
+	if (ret) {
+		pr_err("Failed to allocate char dev region\n");
+		return ret;
+	}
+
 	/* Create device class */
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 4, 0)
 	mock_accel_class = class_create("mock-accel");
@@ -685,24 +996,32 @@ static int __init mock_accel_init(void)
 #endif
 	if (IS_ERR(mock_accel_class)) {
 		pr_err("Failed to create device class\n");
-		return PTR_ERR(mock_accel_class);
+		ret = PTR_ERR(mock_accel_class);
+		goto err_class;
 	}
 
 	/* Register PCI driver */
 	ret = pci_register_driver(&mock_accel_driver);
 	if (ret) {
 		pr_err("Failed to register PCI driver\n");
-		class_destroy(mock_accel_class);
-		return ret;
+		goto err_pci;
 	}
 
+	pr_info("Mock Accelerator Driver loaded (major %d)\n", MAJOR(mock_accel_devt));
 	return 0;
+
+err_pci:
+	class_destroy(mock_accel_class);
+err_class:
+	unregister_chrdev_region(mock_accel_devt, MOCK_ACCEL_MAX_DEVICES);
+	return ret;
 }
 
 static void __exit mock_accel_exit(void)
 {
 	pci_unregister_driver(&mock_accel_driver);
 	class_destroy(mock_accel_class);
+	unregister_chrdev_region(mock_accel_devt, MOCK_ACCEL_MAX_DEVICES);
 	ida_destroy(&mock_accel_ida);
 	pr_info("Mock Accelerator Driver unloaded\n");
 }

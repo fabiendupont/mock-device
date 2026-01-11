@@ -15,6 +15,14 @@ kernel-driver/.*.cmd
 kernel-driver/modules.order
 kernel-driver/Module.symvers
 
+# Test programs
+test-passphrase
+test-passphrase.o
+
+# Firmware (downloaded, not committed to git)
+# The wordlist is packaged with Helm chart but not stored in git root
+firmware/mock-accel-wordlist.txt
+
 # VM images
 test/images/*.qcow2
 !test/images/README.md
